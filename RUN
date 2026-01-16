@@ -1,0 +1,691 @@
+#!/bin/bash
+
+RED='\033[31m'; CYAN='\033[36m'; GREEN='\033[32m'; YELLOW='\033[33m'; NC='\033[0m'; MAGENTA='\033[35m'
+# 默认参数值
+un=$USER
+
+
+code_path=/mnt/18T/cube/usr_code/$un
+output=/mnt/18T/cube/usr_out/$un
+z_path="None"
+h_path="None"
+s_path="None"
+n_path="None"
+r_path="None"
+flag=''
+log_name='None'
+RunIC=true
+RunMain=true
+RunCIC=true
+Findhalo=false
+ncore=16
+nnest=2
+
+PM3=true
+PP=true
+
+checkpoint=0
+
+box=1000
+# nic=2
+ng=128
+
+h0=0.7
+omc=0.2327
+omb=0.0463
+ns=0.972
+As=2.6025e-09
+
+z1=1
+z2=n_checkpoint
+
+# 帮助函数
+usage() {
+    echo "----------------------------------------------------------------------"
+    echo "                               CUBE RUN                               "
+    echo "----------------------------------------------------------------------"
+    echo "Copies CUBE to <code_path> and runs it with specified parameters."
+    echo
+    echo "Usage: CUBE [OPTIONS]"
+    echo
+    echo "Options:"
+    echo "  -flag      <name>        Set flag             [ flag_box_ng  ]  (default: '')"
+    echo "  -c         <path>        Set code path        [ c_path/flag  ]  (default: $code_path)"
+    echo "  -o         <path>        Set output path      [ output/flag  ]  (default: $output)"
+    echo "  -z         <path>        Set z_checkpoint.txt [ None=[200,0] ]  (default: None)"
+    echo "  -h         <path>        Set z_halofind.txt   [ None=[200,0] ]  (default: None)"
+    echo "  -s         <path>        Set Seed             [ None=random  ]  (default: None)"
+    echo "  -n         <path>        Set Noise Map        [ None=random  ]  (default: None)"
+    echo "  -r         <path>        Set Delta L          [ None=random  ]  (default: None)"
+    echo "  -log       <name>        Set log        [ code_path/log_name ]                 "
+    echo "                                          [ None=std;0=run.log ]  (default: None)"
+    echo "                                                                              "
+    echo "  -IC        <true/false>  Run IC              [only,true,false]  (default: $RunIC)"
+    echo "  -Main      <true/false>  Run main            [only,true,false]  (default: $RunMain)"
+    echo "  -Halo      <true/false>  Find halo           [only,true,false]  (default: $Findhalo)"
+    echo "  -Power     <true/false>  Run cicpower        [only,true,false]  (default: $RunCIC)"
+    echo "                                                                               "
+    echo "  -ncore     <num>         Number of cores                        (default: $ncore)"
+    echo "  -nnest     <num>         Number of nests                        (default: $nnest)"
+    echo "  -PM3       <true/false>  Enable PM3 force                       (default: $PM3)"
+    echo "  -PP        <true/false>  Enable PP force                        (default: $PP)"
+    echo "                                                                               "
+    echo "  -box       <num>         Box size in Mpc/h                      (default: $box)"
+    echo "  -h0        <num>         h0                                     (default: $h0)"
+    echo "  -omb       <num>         omega_bar                              (default: $omb)"
+    echo "  -omc       <num>         omega_cdm                              (default: $omc)"
+    echo "  -As        <num>         A_s                                    (default: $As)"
+    echo "  -ns        <num>         n_s                                    (default: $ns)"
+    echo "                                                                               "
+    echo "  -ng        <num>         ng/dim                                 (default: 512)"
+    # echo "  -nic       <num>         using nic times rho for ic             (default: 512)"
+    echo "  -cp        <num>         checkpoint for runin [0=auto        ]  (default: $cp)"
+    echo "  -z1        <int>         halo/power start point                 (default: 1)"
+    echo "  -z2        <int>         halo/power end point [0=n_checkpoint]  (default: 0)"
+    echo "  -README                  Show /mnt/18T/cube/src/README.md" 
+    echo "  -H, --help               Show this help message"
+    echo
+    echo "----------------------------------------------------------------------"
+    echo "              Source Code In /mnt/18T/cube/src"
+    echo "----------------------------------------------------------------------"
+    exit 0
+}
+
+info() {
+    #打印运行参数
+    echo ""
+    echo ""
+    echo -e "${CYAN}--------------------------------  运行参数  --------------------------------${NC}"
+    echo ''
+    echo -e "${CYAN}运行目录${NC}${PURPLE}           : $output/$opath/${NC}"
+    if [ "$z_path" != "None" ]; then
+        echo -e "${CYAN}检查点文件${NC}${PURPLE}         : ${z_path}${NC}"
+    fi
+
+    if [ "$h_path" != "None" ]; then
+        echo -e "${CYAN}halo检查点${NC}${PURPLE}         : ${h_path}${NC}"
+    fi
+
+    if [ "$s_path" != "None" ]; then
+        echo -e "${CYAN}随计数种子${NC}${PURPLE}         : ${s_path}${NC}"
+    fi
+
+    if [ "$n_path" != "None" ]; then
+        echo -e "${CYAN}白噪声文件${NC}${PURPLE}         : ${n_path}${NC}"
+    fi
+
+    if [ "$r_path" != "None" ]; then
+        echo -e "${CYAN}密度场文件${NC}${PURPLE}         : ${r_path}${NC}"
+    fi
+
+    if [ "$log_name" != "None" ]; then
+        echo -e "${CYAN}日志文件${NC}${PURPLE}           : $code_path/$opath/$log_name${NC}"
+    fi
+
+    echo -e "${CYAN}运行模式${NC}           :"
+    runtype=$''
+    if [ "$RunIC" == true ]; then
+        runtype+="${GREEN}▶ 初始条件生成${NC}"$'\n'
+    fi
+    if [ "$RunMain" == true ]; then
+        runtype+="${YELLOW}▶ 主模拟进程${NC}"$'\n'
+    fi
+    if [ "$RunCIC" == true ]; then
+        runtype+="${MAGENTA}▶ 功率谱计算${NC}"$'\n'
+    fi
+    if [ "$Findhalo" == true ];then
+        runtype+="${CYAN}▶ 查找暗晕${NC}"$'\n'
+    fi
+
+    # 格式化输出（保留2空格缩进）
+    if [ -n "$runtype" ]; then
+        echo -e "                     ${runtype//$'\n'/$'\n'                     }"
+    else
+        echo -e "                       \033[31m未配置运行模式${NC}"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${CYAN}核心数${NC}             : ${PURPLE}$nncore${NC} = ${PURPLE}$nteam${NC} x ${PURPLE}$nnest${NC}"
+    echo -e "${CYAN}分辨率${NC}             : ${PURPLE}$box Mpc ; $ng 粒子${NC}"
+    echo ""
+    echo -e "${CYAN}计算PP${NC}             : ${PURPLE}$PP${NC}"
+    echo -e "${CYAN}计算PM3${NC}            : ${PURPLE}$PM3${NC}"
+    echo ""
+
+    echo -e "${CYAN}Hubble常数 h0${NC}      : ${PURPLE}$h0${NC}"
+    echo -e "${CYAN}冷暗物质密度 ω_cdm${NC} : ${PURPLE}$omc${NC}"
+    echo -e "${CYAN}重子物质密度 ω_bar${NC} : ${PURPLE}$omb${NC}"
+    echo -e "${CYAN}谱指数 n_s${NC}         : ${PURPLE}$ns${NC}"
+    echo -e "${CYAN}功率谱振幅 A_s${NC}     : ${PURPLE}$As${NC}"
+
+    echo -e "${CYAN}检查点${NC}             : ${PURPLE}$checkpoint $(awk -v line=$checkpoint '
+                NR==line {
+                    raw = $1 + 0  
+                    z_sprintf = sprintf("%.3f", raw)
+                    sub(/\.$/, ".000", z_sprintf)
+                    print z_sprintf
+                    exit
+                }' z_checkpoint.txt)${NC}"
+    echo ''
+    echo ''
+    echo ''
+}
+
+# 定义执行函数（处理输出重定向）
+run_command() {
+    local cmd="$1"
+    if [ "$log_name" == "None" ]; then
+        echo ""
+        echo ""
+        echo $cmd
+        $cmd
+    else
+        echo ""
+        echo ""
+        echo eval "$cmd >> $(pwd)/$log_name 2>&1"
+        eval "$cmd >> $log_name 2>&1"
+    fi
+}
+
+
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) 
+            code_path="$2"
+            shift 2
+            ;;
+        -o)
+            output="$2"
+            shift 2
+            ;;
+        -flag)
+            flag="$2"
+            shift 2
+            ;;
+        -log)
+            log_name="$2"
+            shift 2
+            ;;
+        -z) 
+            z_path="$2"
+            shift 2
+            ;;
+        -h) 
+            h_path="$2"
+            shift 2
+            ;;
+        -s) 
+            s_path="$2"
+            shift 2
+            ;;
+        -n) 
+            n_path="$2"
+            shift 2
+            ;;
+        -r) 
+            r_path="$2"
+            shift 2
+            ;;
+        -IC)
+            RunIC="$2"
+            shift 2
+            ;;
+        -Main)
+            RunMain="$2"
+            shift 2
+            ;;
+        -Halo)
+            Findhalo="$2"
+            shift 2
+            ;;
+        -Power)
+            RunCIC="$2"
+            shift 2
+            ;;
+        -ncore)
+            ncore="$2"
+            shift 2
+            ;;
+        -nnest)
+            nnest="$2"
+            shift 2
+            ;;
+        -PM3)
+            PM3="$2"
+            shift 2
+            ;;
+        -PP)
+            PP="$2"
+            shift 2
+            ;;
+        -box)
+            box="$2"
+            shift 2
+            ;;
+        -ng)
+            ng="$2"
+            shift 2
+            ;;
+        -h0)
+            h0="$2"
+            shift 2
+            ;;
+        -omb)
+            omb="$2"
+            shift 2
+            ;;
+        -omc)
+            omc="$2"
+            shift 2
+            ;;
+        -As)
+            As="$2"
+            shift 2
+            ;;
+        -ns)
+            ns="$2"
+            shift 2
+            ;;
+        -checkpoint)
+            checkpoint="$2"
+            shift 2
+            ;;
+        -cp)
+            checkpoint="$2"
+            shift 2
+            ;;
+        -z1)
+            z1="$2"
+            shift 2
+            ;;
+        -z2)
+            z2="$2"
+            shift 2
+            ;;
+        -README)
+            vim /mnt/18T/cube/src/README.md
+	    exit 0
+            ;;
+        -H|--help)
+            usage
+            ;;
+        *)
+
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+
+
+if [ "$log_name" == "0" ];then
+    log_name=run.log
+fi
+
+
+if [ "$RunIC" == only ]; then
+    RunIC=true
+    RunMain=false
+    Findhalo=false
+    RunCIC=false
+fi
+
+if [ "$RunMain" == only ]; then
+    RunIC=false
+    RunMain=true
+    Findhalo=false
+    RunCIC=false
+fi
+
+if [ "$RunCIC" == only ]; then
+    RunMain=false
+    RunIC=false
+    Findhalo=false
+    RunCIC=true
+    checkpoint=1
+fi
+
+if [ "$Findhalo" == only ]; then
+    RunIC=false
+    RunMain=false
+    Findhalo=true
+    RunCIC=false
+    checkpoint=1
+fi
+
+
+if [ "$PM3" ==  false ]; then
+    PP=false
+fi
+
+
+if [ "$r_path" != "None" ]; then
+    n_path="None"
+else
+    if [ "$n_path" != "None" ]; then
+        s_path="None"
+    fi
+fi
+
+# # debug warring
+# if [ "$un" != "cbh" ];then
+#     if [ "$PP" ==  true ];then
+#         echo PP有bug正在处理,请关闭PP运行
+#     fi
+#     echo 测试中，稍后运行
+#     exit 0
+# fi
+
+code_path="${code_path/#~\//$HOME/}"
+output="${output/#~\//$HOME/}"
+opath=$flag$box'_'$ng
+name=$flag$box$ng
+nncore=$((ncore))
+nteam=$((nncore/nnest))
+
+
+
+# ======== 检查点处理逻辑 ========
+if [[ "$RunIC" == true ]]; then
+    checkpoint=1
+fi
+
+if [ "$checkpoint" -ne 1 ]; then
+    rawpath=$(pwd)
+    echo $rawpath
+    cd $code_path/$opath
+
+    if [ "$checkpoint" -ne -1 ]; then
+        # ======== 统一文件验证 ========
+        target_file="$output/$opath/image1/$(awk -v line=$checkpoint '
+            NR==line {
+                raw = $1 + 0  
+                z_sprintf = sprintf("%.3f", raw)
+                sub(/\.$/, ".000", z_sprintf)
+                print z_sprintf
+                exit
+            }' z_checkpoint.txt)_xp_1.bin"
+
+        echo $target_file
+        if [ ! -f "$target_file" ]; then
+            echo $target_file
+            target_file="$output/$opath/image1/$(awk -v line=$checkpoint '
+                NR==line {
+                    raw =  $1 + 0.001
+                    z_sprintf = sprintf("%.3f", raw)
+                    sub(/\.$/, ".000", z_sprintf)
+                    print z_sprintf
+                    exit
+                }' z_checkpoint.txt)_xp_1.bin"
+            if [ ! -f "$target_file" ]; then
+                echo $target_file
+                target_file="$output/$opath/image1/$(awk -v line=$checkpoint '
+                    NR==line {
+                        raw =  $1 - 0.0015
+                        z_sprintf = sprintf("%.3f", raw)
+                        sub(/\.$/, ".000", z_sprintf)
+                        print z_sprintf
+                        exit
+                    }' z_checkpoint.txt)_xp_1.bin"
+                if [ ! -f "$target_file" ]; then
+                    checkpoint=-1
+                fi
+            fi
+        fi
+    fi
+
+    if [ 1 -gt "$checkpoint" ]; then
+        echo -e "${RED}无效检查点...${NC}"
+        
+        # 验证输出目录存在性
+        if [ ! -d "$output/$opath/image1" ]; then
+            echo -e "${RED}错误：目录不存在 $output/$opath/image1${NC}"
+            exit 1
+        fi
+
+        # 获取最新文件（按修改时间倒序）
+        latest_file=$(ls -t "$output/$opath/image1"/*_xp_1.bin 2>/dev/null | head -n 1)
+        
+        if [ -z "$latest_file" ]; then
+            echo -e "${RED}错误：找不到任何xp_1.bin文件${NC}"
+            echo -e "${YELLOW}可用文件列表："
+            ls -halFtr "$output/$opath/image1"/*_xp_1.bin 2>/dev/null || echo "无可用文件"
+            exit 1
+        fi
+
+        # 从文件名提取红移值（支持小数和科学计数法）
+        z_value=$(basename "$latest_file" | grep -oE '^[0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?')
+        z_value=$(echo "$z_value=" | awk '{printf "%.3f", $1}')
+        
+        if [ -z "$z_value" ]; then
+            echo -e "${RED}文件名格式错误：${latest_file}${NC}"
+            echo -e "预期格式示例：0.123_xp_1.bin"
+            exit 1
+        fi
+
+        # 反向查找z_checkpoint中的行号
+        if [ ! -f "z_checkpoint.txt" ]; then
+            echo -e "${RED}错误：z_checkpoint文件不存在${NC}"
+            exit 1
+        fi
+
+        # 精确匹配红移值（支持科学计数法）
+        checkpoint=$(awk -v z="$z_value" -v tolerance=0.001 \
+            'BEGIN{FS="[ \t]+"; target=z+0} 
+            {current=$1+0; 
+            if (current >= target - tolerance && current <= target + tolerance) {
+                print NR;
+            }}' z_checkpoint.txt)
+
+        if [ -z "$checkpoint" ]; then
+            echo -e "${RED}错误：未找到红移值 $z_value 对应的检查点${NC}"
+            echo -e "${YELLOW}z_checkpoint 内容预览："
+            head -n 5 z_checkpoint.txt
+            exit 1
+        fi
+
+        ls -ltr "$output/$opath/image1"/*_xp_1.bin | tail -4
+        echo -e "   ${GREEN}建议检查点：${CYAN}$checkpoint (z=$z_value)${NC}"
+        while true; do
+            read -p "使用该检查点？[Y使用/N退出]: " yn
+            case $yn in
+                [Yy]* ) echo "继续执行..."; break;;
+                [Nn]* ) echo "退出脚本"; exit 1;;
+                * ) echo "请输入 Y 或 N";;
+            esac
+        done
+    fi
+
+    cd $rawpath
+fi
+
+
+# 进入程序目录
+cd /mnt/18T/cube/src
+source module_load_t7920.sh
+source /mnt/18T/cube/py/anaconda3/bin/activate
+
+# python --version
+# which python
+# python ./ic.py
+# exit 0
+
+# 如果目标目录已存在则备份日志
+target_dir="$code_path/$opath"  # 定义实际操作的目录路径
+mkdir -p $target_dir
+if [ -d "$target_dir" ]; then
+    if [ -f "$target_dir/$log_name" ]; then
+        timestag=$(date +"%Y%m%d_%H%M%S")
+        backup_file="${opath}_${timestag}.log"
+        echo -e "${YELLOW}发现历史日志：备份为 ${backup_file}${NC}"
+        mkdir -p /home/ChenBH/mnus/log_backup/$opath
+        cp -v "$target_dir/run.log" "/home/ChenBH/mnus/log_backup/$opath/$backup_file"
+    fi
+
+    pwd
+
+    # output=${output//\//\\/}
+    if [ "$RunIC" == true ] || [ "$RunMain" == true ]; then
+        echo -e "${CYAN}全量模式：重建目录[$target_dir]${NC}"
+        cp -r ./* $target_dir
+        cd "$target_dir" || {
+            echo -e "${RED}错误：无法进入目录 $target_dir${NC}"
+            exit 1
+        }
+        sed -i "s/.*parameter :: opath=.*/  character(*),parameter :: opath='${output//\//\\/}\/$opath\/'/" parameters.f90
+        sed -i "s/.*parameter :: box=.*/  real,parameter :: box=$box/" parameters.f90
+        sed -i "s/.*parameter :: ng=.*/  integer(8),parameter :: ng=$ng/" parameters.f90
+        sed -i "s/.*parameter :: ncore=.*/  integer,parameter :: ncore=$nncore/" parameters.f90
+        sed -i "s/.*parameter :: nteam=.*/  integer,parameter :: nteam=$nteam/" parameters.f90
+        sed -i "s/.*parameter :: nnest=.*/  integer,parameter :: nnest=$nnest/" parameters.f90
+        sed -i "s/.*parameter :: h0=.*/  real, parameter :: h0=$h0/" parameters.f90
+        sed -i "s/.*parameter :: omega_cdm=.*/  real,parameter :: omega_cdm=$omc/" parameters.f90
+        sed -i "s/.*parameter :: omega_bar=.*/  real,parameter :: omega_bar=$omb/" parameters.f90
+        sed -i "s/.*parameter :: n_s=.*/  real,parameter :: n_s=$ns/" parameters.f90
+        sed -i "s/.*parameter :: A_s=.*/  real,parameter :: A_s=$As/" parameters.f90
+        if [ $checkpoint -eq 1 ]; then
+            sed -i "s/.*logical,parameter :: read_Gks=.*/   logical,parameter :: read_Gks=.false./" initialize.f90
+            sed -i "s/.*sim%cur_checkpoint=.*/   sim%cur_checkpoint=1/" initialize.f90
+        else
+            echo check 222
+            sed -i "s/.*logical,parameter :: read_Gks=.*/   logical,parameter :: read_Gks=.true./" initialize.f90
+            sed -i "s/.*sim%cur_checkpoint=.*/   sim%cur_checkpoint=$checkpoint/" initialize.f90
+        fi
+        
+        if [ "$PM3" ==  true ]; then
+            sed -i "s/.*logical,parameter :: PM3=.*/  logical,parameter :: PM3=.true./" kick.f90
+        else
+            sed -i "s/.*logical,parameter :: PM3=.*/  logical,parameter :: PM3=.false./" kick.f90
+        fi
+
+
+        if [ "$PP" ==  true ]; then
+            sed -i "s/.*logical,parameter :: PP=.*/  logical,parameter :: PP=.true./" kick.f90
+        else
+            sed -i "s/.*logical,parameter :: PP=.*/  logical,parameter :: PP=.false./" kick.f90
+        fi
+
+        if [ "$s_path" != "None" ]; then
+            cp -v $s_path $output/$opath/image1/seed_1.bin
+            sed -i "s/.*#define READ_SEED/#define READ_SEED/" utilities/ic.f90
+        else
+            sed -i "s/.*#define READ_SEED/!#define READ_SEED/" utilities/ic.f90
+        fi
+
+        if [ "$n_path" != "None" ]; then
+            cp -v $n_path $output/$opath/image1/noise_1.bin
+            sed -i "s/.*#define READ_NOISE/#define READ_NOISE/" utilities/ic.f90
+        else
+            sed -i "s/.*#define READ_NOISE/!#define READ_NOISE/" utilities/ic.f90
+        fi
+
+        if [ "$r_path" != "None" ]; then
+            cp -v $r_path $output/$opath/image1/delta_L_1.bin
+            sed -i "s/.*#define READ_RHO/#define READ_RHO/" utilities/ic.f90
+        else
+            sed -i "s/.*#define READ_RHO/!#define READ_RHO/" utilities/ic.f90
+        fi
+
+
+    else
+        echo -e "${CYAN}增量模式：更新CIC文件${NC}"
+        cp -r ./run.qsub $target_dir
+        cp -r ./utilities/*  $target_dir/utilities
+        cd "$target_dir" || {
+            echo -e "${RED}错误：无法进入目录 $target_dir${NC}"
+            exit 1
+        }
+    fi
+fi
+
+
+cd "$target_dir" || {
+    echo -e "${RED}错误：无法进入目录 $target_dir${NC}"
+    exit 1
+}
+if [ "$z_path" != "None" ]; then
+    cp -v $z_path ./
+fi
+if [ "$h_path" != "None" ]; then
+    cp -v $h_path ./
+fi
+
+info
+while true; do
+    read -p "参数正确？[Y/N]: " yn
+    case $yn in
+        [Yy]* ) echo "继续执行..."; break;;
+        [Nn]* ) echo "退出脚本"; exit 1;;
+        * ) echo "请输入 Y 或 N";;
+    esac
+done
+echo ''
+echo ''
+
+echo -e "${GREEN}当前工作目录：${NC}$(pwd)"
+
+rm -v *.log
+
+
+# 输出运行信息
+if [ "$log_name" != "None" ]; then
+    date > "$log_name"
+    info >> "$log_name"
+fi
+
+# 运行IC生成
+if [ "$RunIC" == true ]; then
+    cd utilities
+    make clean
+    make ic.x
+    cd ..
+    [ "$log_name" != "None" ] && echo "RunIC" >> "$log_name"
+    run_command "./utilities/ic.x"
+
+    if [ "$RunCIC" == true ]; then
+        sed -i "s/\(cur_checkpoint=\) \([0-9]\+\),\([0-9]\+\)/\1 1,1/" utilities/cicpower.f90
+        cd utilities
+        make cicpower.x
+        cd ..
+        run_command "./utilities/cicpower.x"
+    fi
+fi
+
+# 运行主程序
+if [ "$RunMain" == true ]; then
+    make clean
+    make 
+    [ "$log_name" != "None" ] && echo "RunMain" >> "$log_name"
+    run_command "time ./main.x"
+    if [ "$RunCIC" == true ]; then
+        sed -i "s/\(cur_checkpoint=\) \([0-9]\+\),\([0-9]\+\)/\1 $z1,$z2/" utilities/cicpower.f90
+        cd utilities
+        make cicpower.x
+        cd ..
+        run_command "./utilities/cicpower.x"
+    fi
+fi  
+
+# 单独运行CIC
+if [ "$RunCIC" == true ] && [ "$RunMain" != true ] && [ "$RunIC" != true ] && [ "$Findhalo" != true ]; then
+    sed -i "s/\(cur_checkpoint=\) \([0-9]\+\),\([0-9]\+\)/\1 $z1,$z2/" utilities/cicpower.f90
+    cd utilities
+    make cicpower.x
+    cd ..
+    [ "$log_name" != "None" ] && echo "CIC" >> "$log_name"
+    run_command "./utilities/cicpower.x"
+fi
+
+if [ "$Findhalo" == true ]; then
+    [ "$log_name" != "None" ] && echo "Findhalo" >> "$log_name"
+    sed -i "s/\(cur_checkpoint=\) \([0-9]\+\),\([0-9]\+\)/\1 $z1,$z2/" utilities/fof.f90
+    cd utilities
+    make clean
+    make fof.x
+    cd ..
+    run_command "./utilities/fof.x"
+fi
+
