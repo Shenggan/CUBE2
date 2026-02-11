@@ -2,7 +2,7 @@ module parameters
   implicit none
   
   ! output directory
-  character(*),parameter :: opath='/mnt/18T/cube/usr_out/cbh/1000_128/'
+  character(*),parameter :: opath='/home/nus-csg/CUBE2/out/cbh/1000_128/'
 
   ! zip parameters
   integer,parameter :: ndim=3
@@ -16,7 +16,7 @@ module parameters
   integer,parameter :: ncore=32
   integer,parameter :: nteam=8
   integer,parameter :: nnest=4
-  integer(8),parameter :: ng=512
+  integer(8),parameter :: ng=128
 
   integer,parameter :: ratio_cs=4
   integer,dimension(7),parameter :: ratio_sf=[1,2,4,6,8,12,16]

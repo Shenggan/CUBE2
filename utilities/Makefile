@@ -6,6 +6,10 @@ OPTIONS+=-DPID
 MODEFILE:=$(wildcard *.f90)
 OBJFILE:=$(addprefix ,$(notdir $(MODEFILE:.f90=.o)))
 
+XFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
+OFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
+FFTFLAG=-I${MKLROOT}/include/fftw/ -qmkl
+
 all: ic.x cicpower.x fof.x fof_merge.x #write_gadget_format.x dsp.x
 	@echo "made:" $^
 ic.x: ic.o parameters.o pencil_fft.o
@@ -30,19 +34,19 @@ buffer_grid.o: variables.o
 buffer_particle.o: variables.o
 
 parameters.o: ../parameters.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 variables.o: ../variables.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 particle_initialization.o: ../particle_initialization.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 buffer_grid.o: ../buffer_grid.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 buffer_particle.o: ../buffer_particle.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 %.o: %.f90 Makefile parameters.o pencil_fft.o powerspectrum.o
-	$(FC) $(OFLAG) $(OPTIONS) $(FFTFLAG) $< -o $@
+	$(FC) -c $(OFLAG) $(OPTIONS) $(FFTFLAG) $< -o $@
 pencil_fft.o: ../pencil_fft.f90 parameters.o
-	$(FC) $(OFLAG) $(OPTIONS) $< $(FFTFLAG)
+	$(FC) -c $(OFLAG) $(OPTIONS) $< $(FFTFLAG)
 *.o: Makefile
 
 clean:

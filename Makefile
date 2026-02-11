@@ -4,7 +4,11 @@ OPTIONS+=-DHALOFIND
 #OPTIONS+=-DSPEEDTEST
 
 MODFILE:=$(wildcard *.f90)
-OBJFILE:=$(addprefix ,$(notdir $(MODFILE:.f90=.o))) Green.o
+OBJFILE:=$(addprefix ,$(notdir $(MODFILE:.f90=.o))) Green.o pp_force_kernel.o
+
+XFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
+OFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
+FFTFLAG=-I${MKLROOT}/include/fftw/ -qmkl
 
 all: main.x
 	@echo "done"
@@ -23,11 +27,15 @@ main.o: $(OBJFILE)
 #$(OBJFILE): variables.o
 
 parameters.o: parameters.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 Green.o: ./Green/Green.f90
-	$(FC) $(OFLAG) $(OPTIONS) $<
+	$(FC) -c $(OFLAG) $(OPTIONS) $<
 %.o: %.f90 Makefile
-	$(FC) $(OFLAG) $(OPTIONS) $< -o $@ $(FFTFLAG)
+	$(FC) -c $(OFLAG) $(OPTIONS) $< -o $@ $(FFTFLAG)
+
+pp_force_kernel.o: pp_force_kernel.c
+	icx -O3 -xHost -qopenmp -c pp_force_kernel.c -o pp_force_kernel.o
+# 	gcc -O3 -fopenmp -c pp_force_kernel.c -o pp_force_kernel.o
 
 clean:
 	rm -f *.mod *.o *.out *.err *.x *~

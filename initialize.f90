@@ -30,7 +30,7 @@ subroutine initialize
   dt=0
   dt_old=0
   da=0
-  sim%cur_checkpoint=99 ! change for resuming checkpoints
+  sim%cur_checkpoint=1 ! change for resuming checkpoints
   sim%cur_halofind=1
   z_checkpoint=-9999
   z_halofind=-9999
