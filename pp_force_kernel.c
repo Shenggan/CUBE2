@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-const int ng = 128;
+const int ng = 512;
 const int nnt = 4;
 const int nns = 4;
 const int ratio_cs = 4;
@@ -17,8 +17,8 @@ const int ncb = ngb / ratio_cs;
 const int ns3 = (nnt * nns) * (nnt * nns) * (nnt * nns);
 
 const int ncore = 32;
-const int nteam = 8;
-const int nnest = 4;
+const int nteam = 4;
+const int nnest = 8;
 
 const double pi = 3.14159265358979323846;
 
@@ -27,6 +27,20 @@ const double rshift = 0.5 - ishift;
 const double x_resolution = 1.0 / ((int64_t)1 << 16);
 
 const double app = 0.06;
+
+static inline double elapsed_sec(const struct timespec* t1, const struct timespec* t2) {
+    return (double)(t2->tv_sec - t1->tv_sec) + (double)(t2->tv_nsec - t1->tv_nsec) * 1.0e-9;
+}
+
+static int pp_timing_level(void) {
+    static int level = -1;
+    if (level >= 0) return level;
+    {
+        const char* env = getenv("CUBE_PP_TIMING");
+        level = env ? atoi(env) : 0;
+    }
+    return level;
+}
 
 float F_ra(float r, float apm) {
     float ep;
@@ -117,7 +131,7 @@ void radix_sort_u32_pair(uint32_t* keys, uint32_t* vals, int N) {
     free(vals_tmp);
 }
 
-void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], int nc2[3],
+void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc1[3], int nc2[3],
                                int utile_shift[3], int ratio_sf[], float apm3[],
                                int* _rhoc,         // [nnt, nnt, nnt, nt+2*ncb, nt+2*ncb, nt+2*ncb]
                                int64_t* _idx_b_r,  // [nnt, nnt, nnt, nt+2*ncb, nt+2*ncb]
@@ -126,11 +140,15 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
                                float mass_p_cdm, float a_mid, float dt, float* f2max_t_,
                                float vmax_t_[3], double* ptotal, double* ttotal) {
     struct timespec t1, t2;
+    struct timespec tprep1, tprep2, tforce1, tforce2, tupdate1, tupdate2;
+    double dt_prep = 0.0, dt_force = 0.0, dt_update = 0.0;
+    const int timing = pp_timing_level();
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (timing >= 2) clock_gettime(CLOCK_MONOTONIC, &tprep1);
 
     float pp_range = apm3[iapm - 1];
     int rcp = ratio_sf[iapm - 1];
-    int npgrid = ntt * rcp;
+    int npgrid = nt * rcp;
 
     int (*rhoc)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb][nt + 2 * ncb] =
         (int (*)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb][nt + 2 * ncb]) _rhoc;
@@ -226,10 +244,7 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
     radix_sort_u32_pair(keys, values, N);
 
     float* _xf_sorted = (float*)malloc(3 * N * sizeof(float));
-    float* _vf_sorted = (float*)malloc(3 * N * sizeof(float));
-
     float (*xf_sorted)[N] = (float (*)[N])_xf_sorted;
-    float (*vf_sorted)[N] = (float (*)[N])_vf_sorted;
 
     // gather xf vf
     for (int i = 0; i < N; i++) {
@@ -237,10 +252,6 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
         xf_sorted[0][i] = xf[ori_idx][0];
         xf_sorted[1][i] = xf[ori_idx][1];
         xf_sorted[2][i] = xf[ori_idx][2];
-
-        vf_sorted[0][i] = vf[ori_idx][0];
-        vf_sorted[1][i] = vf[ori_idx][1];
-        vf_sorted[2][i] = vf[ori_idx][2];
     }
 
     // build cell start index
@@ -260,6 +271,11 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
         if (cell_start[i] == -1) {
             cell_start[i] = cell_start[i + 1];
         }
+    }
+    if (timing >= 2) {
+        clock_gettime(CLOCK_MONOTONIC, &tprep2);
+        dt_prep = elapsed_sec(&tprep1, &tprep2);
+        clock_gettime(CLOCK_MONOTONIC, &tforce1);
     }
 
 // compute pp force
@@ -307,6 +323,11 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
             }
         }
     }
+    if (timing >= 2) {
+        clock_gettime(CLOCK_MONOTONIC, &tforce2);
+        dt_force = elapsed_sec(&tforce1, &tforce2);
+        clock_gettime(CLOCK_MONOTONIC, &tupdate1);
+    }
 
     *f2max_t_ = 0.0f;
     vmax_t_[0] = 0.0f;
@@ -341,10 +362,13 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
             }
         }
     }
+    if (timing >= 2) {
+        clock_gettime(CLOCK_MONOTONIC, &tupdate2);
+        dt_update = elapsed_sec(&tupdate1, &tupdate2);
+    }
 
     free(cell_start);
     free(_xf_sorted);
-    free(_vf_sorted);
     free(keys);
     free(values);
 
@@ -356,7 +380,12 @@ void c_pp_force_kernel_subtile(int itile, int iapm, int tile1[3], int nc1[3], in
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     ptotal[itile] = ncount;
-    ttotal[itile] = (double)(t2.tv_sec - t1.tv_sec) + (double)(t2.tv_nsec - t1.tv_nsec) * 1.0e-9;
+    ttotal[itile] = elapsed_sec(&t1, &t2);
+    if (timing >= 2) {
+        fprintf(stderr,
+                "[PP-CPU-TILE] itile=%d iapm=%d ncount=%d total=%.6fs prep=%.6fs force=%.6fs update=%.6fs\n",
+                itile, iapm, ncount, ttotal[itile], dt_prep, dt_force, dt_update);
+    }
 
     return;
 }
@@ -369,22 +398,27 @@ void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][6], float a
                                   float* _vp,         // [nplocal, 3]
                                   float mass_p_cdm, float a_mid, float dt, float* f2max,
                                   float vmax[3], double* ptotal, double* ttotal) {
+    struct timespec t1, t2;
+    const int timing = pp_timing_level();
+    if (timing >= 1) clock_gettime(CLOCK_MONOTONIC, &t1);
+
     float _f2max = 0.0f;
-#pragma omp parallel for default(shared) num_threads(8) schedule(dynamic) reduction(max : _f2max, vmax[ : 3])
-    for (int it = 0; it < ns3; it++) {
-        int itile = isort[it] - 1;
+#pragma omp parallel for default(shared) num_threads(nteam) schedule(dynamic) reduction(max : _f2max, vmax[ : 3])
+    for (int it = 0; it < nnt*nnt*nnt; it++) {
+        int itile = it;
         int iapm = ires[itile];
 
-        int tile1[3] = {ixyz3[itile][3], ixyz3[itile][4], ixyz3[itile][5]};
-        int utile_shift[3] = {ixyz3[itile][0] - 1, ixyz3[itile][1] - 1, ixyz3[itile][2] - 1};
-        int nc1[3] = {(ixyz3[itile][0] - 1) * ntt + 1, (ixyz3[itile][1] - 1) * ntt + 1,
-                      (ixyz3[itile][2] - 1) * ntt + 1};
-        int nc2[3] = {ixyz3[itile][0] * ntt, ixyz3[itile][1] * ntt, ixyz3[itile][2] * ntt};
+        int tile1[3] = {it / (nnt * nnt) + 1,
+                        (it / nnt) % nnt + 1,
+                        it % nnt + 1};
+        int utile_shift[3] = {0, 0, 0};
+        int nc1[3] = {1, 1, 1};
+        int nc2[3] = {nt, nt, nt};
 
         float f2max_team;
         float vmax_team[3];
 
-        c_pp_force_kernel_subtile(itile, iapm, tile1, nc1, nc2, utile_shift, ratio_sf, apm3, _rhoc,
+        c_pp_force_kernel_tile(itile, iapm, tile1, nc1, nc2, utile_shift, ratio_sf, apm3, _rhoc,
                                   _idx_b_r, _xp, _vp, mass_p_cdm, a_mid, dt, &f2max_team, vmax_team,
                                   ptotal, ttotal);
 
@@ -394,5 +428,18 @@ void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][6], float a
         vmax[2] = fmaxf(vmax[2], vmax_team[2]);
     }
     *f2max = _f2max;
+    if (timing >= 1) {
+        double ttotal_sum = 0.0;
+        double ptotal_sum = 0.0;
+        for (int it = 0; it < nnt * nnt * nnt; it++) {
+            ttotal_sum += ttotal[it];
+            ptotal_sum += ptotal[it];
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t2);
+        fprintf(stderr,
+                "[PP-CPU] total=%.6fs tiles_sum=%.6fs pcount_sum=%.0f f2max=%.6e vmax=(%.6e, %.6e, %.6e)\n",
+                elapsed_sec(&t1, &t2), ttotal_sum, ptotal_sum, (double)(*f2max), (double)vmax[0],
+                (double)vmax[1], (double)vmax[2]);
+    }
     return;
 }

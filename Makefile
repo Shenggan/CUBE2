@@ -4,11 +4,12 @@ OPTIONS+=-DHALOFIND
 #OPTIONS+=-DSPEEDTEST
 
 MODFILE:=$(wildcard *.f90)
-OBJFILE:=$(addprefix ,$(notdir $(MODFILE:.f90=.o))) Green.o pp_force_kernel.o
+OBJFILE:=$(addprefix ,$(notdir $(MODFILE:.f90=.o))) Green.o pp_force_kernel_cuda.o
 
 XFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
 OFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
-FFTFLAG=-I${MKLROOT}/include/fftw/ -qmkl
+FFTFLAG=-I${MKLROOT}/include/fftw/ -qmkl -L${CUDA_HOME}/lib64 -lcuda -lcudart -lstdc++
+# -L${CUDA_HOME}/lib64 -lcuda -lcudart -lstdc++
 
 all: main.x
 	@echo "done"
@@ -36,6 +37,9 @@ Green.o: ./Green/Green.f90
 pp_force_kernel.o: pp_force_kernel.c
 	icx -O3 -xHost -qopenmp -c pp_force_kernel.c -o pp_force_kernel.o
 # 	gcc -O3 -fopenmp -c pp_force_kernel.c -o pp_force_kernel.o
+
+pp_force_kernel_cuda.o: pp_force_kernel.cu
+	nvcc -O3 -Xcompiler -fopenmp -c pp_force_kernel.cu -o pp_force_kernel_cuda.o
 
 clean:
 	rm -f *.mod *.o *.out *.err *.x *~

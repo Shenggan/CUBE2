@@ -37,6 +37,8 @@ subroutine kick
   real(8) pt
   real npc_max(ns3),overden_phy
   
+  call tic(15)
+  
   if (head) print*,'PM1' ! =====================================================
   call tic(11)
   iapm=1; pm%pm_layer=1; pm%iapm=iapm; pm%nwork=nt; pm%nstart(:)=1; pm%nend(:)=nc
@@ -163,12 +165,15 @@ subroutine kick
   if (PP) then ! =====================================================
     if (head) print*,'PP'
     call tic(14)
-    allocate(ptotal(ns3),ttotal(ns3))
     vmax=0; f2max=0; pt=0
+    
+    allocate(ptotal(nnt*nnt*nnt),ttotal(nnt*nnt*nnt))
     call c_pp_force_kernel(isort, ires, ixyz3, apm3, ratio_sf, &
-                             rhoc, idx_b_r, xp, vp, &
-                             sim%mass_p_cdm, a_mid, dt, &
-                             f2max, vmax, ptotal, ttotal)
+                           rhoc, idx_b_r, xp, vp, &
+                           sim%mass_p_cdm, a_mid, dt, &
+                           f2max, vmax, ptotal, ttotal)
+
+    ! allocate(ptotal(ns3),ttotal(ns3))
     ! !$omp paralleldo num_threads(nteam) schedule(dynamic,1)&
     ! !$omp& default(shared) private(it,iteam,itile,iapm,nl,nh,i1,i2,i3,pm,rho_th,force_th,vmax_team,f2max_team)&
     ! !$omp& private(rcp,npgrid,nptile,ll,hoc,ip_local,xf,vf,af)&
@@ -220,12 +225,12 @@ subroutine kick
   sim%dt_vmax=sim[1]%dt_vmax
   sync all
 
+  call toc(15)
   if (head) then 
-    tcat(61:67,istep)=napm
+    tcat(61:67,istep)=real(napm,kind=kind(tcat))
     print*,'    napm =',napm
-    print*,'  real time =',tcat(13,istep),real(t2-t1)/t_rate,'secs'
+    print*,'  real time =',tcat(15,istep),'secs'
   endif
-  call toc(5)
 
   contains
 
