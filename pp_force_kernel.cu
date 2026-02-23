@@ -5,10 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-
-#include <vector>
-
 #include <thrust/detail/caching_allocator.h>
 #include <thrust/device_ptr.h>
 #include <thrust/functional.h>
@@ -17,6 +13,9 @@
 #include <thrust/replace.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
+#include <time.h>
+
+#include <vector>
 
 // -------------------------
 // Global configuration
@@ -26,6 +25,7 @@ const int nnt = 4;
 const int nns = 4;
 const int ratio_cs = 4;
 const int nc = ng / ratio_cs;
+const int np_nc = ratio_cs;
 const int nt = nc / nnt;
 const int ntt = nt / nns;
 const int ngb = 16;
@@ -33,19 +33,14 @@ const int ncb = ngb / ratio_cs;
 const int nte = nt + 2 * ncb;
 const int ns3 = (nnt * nns) * (nnt * nns) * (nnt * nns);
 
-const int ncore = 32;
-const int nteam = 4;
-const int nnest = 8;
-
 const bool body_centered_cubic = false;
 const int image_buffer = 2;
 const int tile_buffer = 3;
-const int np_nc = ratio_cs;
+
 const int64_t np_image = (nc * np_nc) * (nc * np_nc) * (nc * np_nc) * (1 + body_centered_cubic);
 const int64_t np_image_max = np_image * ((int64_t)nte * 1.0 / (int64_t)nt) *
                              ((int64_t)nte * 1.0 / (int64_t)nt) *
                              ((int64_t)nte * 1.0 / (int64_t)nt) * image_buffer;
-//
 const int64_t np_tile_max = np_image / (nnt * nnt * nnt) *
                             ((nte * 1.0 / nt) * (nte * 1.0 / nt) * (nte * 1.0 / nt)) * tile_buffer;
 const size_t N_vp = (size_t)np_image_max * 3 * sizeof(float);
@@ -56,6 +51,9 @@ const double rshift = 0.5 - ishift;
 const double x_resolution = 1.0 / ((int64_t)1 << 16);
 
 const double app = 0.06;
+
+const int ncore = 32;
+
 const int kCellBuildThreads = 256;
 const int kUpdateThreads = 256;
 const int kPPThreads = 128;
@@ -70,6 +68,10 @@ const int kD2HBufferCount = 2;
             exit(EXIT_FAILURE);                                                                 \
         }                                                                                       \
     } while (0)
+
+static inline double elapsed_sec(const struct timespec& t1, const struct timespec& t2) {
+    return (double)(t2.tv_sec - t1.tv_sec) + (double)(t2.tv_nsec - t1.tv_nsec) * 1.0e-9;
+}
 
 __device__ __forceinline__ float F_ra_dev(float r, float apm) {
     float ep = 2.0f * r / apm;
@@ -116,12 +118,12 @@ __global__ void build_cell_start_end_kernel(const uint32_t* __restrict__ keys_so
 }
 
 __device__ __forceinline__ void atomicMaxFloatNonNeg(float* addr, float val) {
-    // 仅适用于 val >= 0 且 *addr >= 0
+    // Only valid when val >= 0 and *addr >= 0.
     int* addr_i = reinterpret_cast<int*>(addr);
     int old = *addr_i;
     int v = __float_as_int(val);
 
-    // 如果当前已经 >= val，直接返回
+    // If current value is already >= val, return directly.
     while (old < v) {
         int assumed = old;
         old = atomicCAS(addr_i, assumed, v);
@@ -153,9 +155,9 @@ __global__ void pp_force_kernel(const float* __restrict__ xf0, const float* __re
         float ax = 0.f, ay = 0.f, az = 0.f;
 
         for (int kk = -1; kk <= 1; kk++) {
-// #pragma unroll
+            // #pragma unroll
             for (int jj = -1; jj <= 1; jj++) {
-// #pragma unroll
+                // #pragma unroll
                 for (int ii = -1; ii <= 1; ii++) {
                     int nidx =
                         (k + kk + rcp) * stride * stride + (j + jj + rcp) * stride + (i + ii + rcp);
@@ -193,8 +195,7 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
                                 const uint32_t* __restrict__ values_sorted,
                                 float* __restrict__ vp_flat, int N, float mass2, float a_mid,
                                 float dt, float* __restrict__ f2_global,
-                                float* __restrict__ vmax_global0,
-                                float* __restrict__ vmax_global1,
+                                float* __restrict__ vmax_global0, float* __restrict__ vmax_global1,
                                 float* __restrict__ vmax_global2) {
     extern __shared__ float s[];
     float* sf2 = s;
@@ -248,12 +249,12 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
         __syncthreads();
     }
 
-    // 关键改动：每个 block 的最大值直接 atomic 到 4 个全局标量
+    // atomically accumulate each block's maxima into 4 global scalars.
     if (tid == 0) {
-        atomicMaxFloatNonNeg(f2_global,      sf2[0]);
-        atomicMaxFloatNonNeg(vmax_global0,   sv0[0]);
-        atomicMaxFloatNonNeg(vmax_global1,   sv1[0]);
-        atomicMaxFloatNonNeg(vmax_global2,   sv2[0]);
+        atomicMaxFloatNonNeg(f2_global, sf2[0]);
+        atomicMaxFloatNonNeg(vmax_global0, sv0[0]);
+        atomicMaxFloatNonNeg(vmax_global1, sv1[0]);
+        atomicMaxFloatNonNeg(vmax_global2, sv2[0]);
     }
 }
 
@@ -289,7 +290,7 @@ struct PPForceWorkspace {
     float* vmax_teams;
     float* vp_d2h_buffer[2];
 
-    int max_rcp;
+    int rcp;
     int n_cap;
     int grid_num_cap;
     int upd_blocks_cap;
@@ -302,33 +303,21 @@ struct PPForceWorkspace {
     cudaEvent_t event_reduce_done;
 };
 
-static inline double elapsed_sec(const struct timespec& t1, const struct timespec& t2) {
-    return (double)(t2.tv_sec - t1.tv_sec) + (double)(t2.tv_nsec - t1.tv_nsec) * 1.0e-9;
-}
-
-static int pp_timing_level() {
-    static int level = -1;
-    if (level >= 0) return level;
-    const char* env = getenv("CUBE_PP_TIMING");
-    level = env ? atoi(env) : 0;
-    return level;
-}
-
-static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
+static void init_pp_workspace(PPForceWorkspace* ws, int rcp) {
     memset(ws, 0, sizeof(*ws));
 
-    ws->max_rcp = max_rcp;
+    ws->rcp = rcp;
     ws->n_cap = (int)np_tile_max;
     ws->upd_blocks_cap = (ws->n_cap + kUpdateThreads - 1) / kUpdateThreads;
 
-    int stride = ntt * max_rcp + 2 * max_rcp;
+    int stride = nt * rcp + 2 * rcp;
     ws->grid_num_cap = stride * stride * stride;
 
-    CUDA_CHECK(cudaMallocHost(&ws->xf0_h,    ws->n_cap * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(&ws->xf1_h,    ws->n_cap * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(&ws->xf2_h,    ws->n_cap * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&ws->xf0_h, ws->n_cap * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&ws->xf1_h, ws->n_cap * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&ws->xf2_h, ws->n_cap * sizeof(float)));
     CUDA_CHECK(cudaMallocHost(&ws->ip_local_h, ws->n_cap * sizeof(int64_t)));
-    CUDA_CHECK(cudaMallocHost(&ws->keys_h,   ws->n_cap * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocHost(&ws->keys_h, ws->n_cap * sizeof(uint32_t)));
     CUDA_CHECK(cudaMallocHost(&ws->values_h, ws->n_cap * sizeof(uint32_t)));
 
     CUDA_CHECK(cudaMallocHost(&ws->f2max_teams, (size_t)nnt * nnt * nnt * sizeof(float)));
@@ -362,15 +351,18 @@ static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
     CUDA_CHECK(cudaEventCreate(&ws->event_h2d_done));
     CUDA_CHECK(cudaEventCreate(&ws->event_reduce_done));
 
+    // Pre-record events to avoid first-time recording overhead during the main loop.
+    cudaEventRecord(ws->event_reduce_done, ws->compute_stream);
+
     // warmup thrust sort
-    auto exec = thrust::cuda::par(thrust::detail::single_device_tls_caching_allocator()).on(ws->compute_stream);
+    auto exec = thrust::cuda::par(thrust::detail::single_device_tls_caching_allocator())
+                    .on(ws->compute_stream);
     thrust::device_ptr<uint32_t> kptr(ws->d_keys);
     thrust::device_ptr<uint32_t> vptr(ws->d_values);
     thrust::sort_by_key(exec, kptr, kptr + ws->n_cap, vptr);
 }
 
 static void destroy_pp_workspace(PPForceWorkspace* ws) {
-
     CUDA_CHECK(cudaEventDestroy(ws->event_h2d_done));
     CUDA_CHECK(cudaEventDestroy(ws->event_reduce_done));
     CUDA_CHECK(cudaStreamDestroy(ws->h2d_stream));
@@ -417,21 +409,20 @@ static void pp_ws_atexit_cleanup() {
     if (g_pp_ws_inited) {
         destroy_pp_workspace(&g_pp_ws);
         g_pp_ws_inited = 0;
-        // 可选：为了安全把结构体清零
+        // Optional: zero-initialize the struct for safety.
         memset(&g_pp_ws, 0, sizeof(g_pp_ws));
     }
 }
 
-static inline PPForceWorkspace* get_pp_workspace_static(int max_rcp) {
+static inline PPForceWorkspace* get_pp_workspace_static(int rcp) {
     if (!g_pp_ws_inited) {
-        init_pp_workspace(&g_pp_ws, max_rcp);
+        init_pp_workspace(&g_pp_ws, rcp);
         g_pp_ws_inited = 1;
         atexit(pp_ws_atexit_cleanup);
     } else {
-        if (g_pp_ws.max_rcp != max_rcp) {
-            fprintf(stderr,
-                    "[PP] max_rcp changed: old=%d new=%d (static ws, no resize)\n",
-                    g_pp_ws.max_rcp, max_rcp);
+        if (g_pp_ws.rcp != rcp) {
+            fprintf(stderr, "[PP] rcp changed: old=%d new=%d (static ws, no resize)\n",
+                    g_pp_ws.rcp, rcp);
             exit(EXIT_FAILURE);
         }
     }
@@ -458,7 +449,7 @@ static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_hos
 
     auto add_vp_chunk = [](float* __restrict__ dst, const float* __restrict__ src, size_t count) {
         const int n = (int)count;
-        #pragma omp parallel for simd num_threads(ncore) schedule(static)
+#pragma omp parallel for simd num_threads(ncore) schedule(static)
         for (int i = 0; i < n; i++) {
             dst[i] += src[i];
         }
@@ -472,7 +463,8 @@ static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_hos
         const size_t remain = vp_elems - offset_cur;
         const size_t elems_cur = (remain < chunk_elems) ? remain : chunk_elems;
 
-        // Launch current copy first, so GPU copy can overlap with host accumulation of previous chunk.
+        // Launch current copy first, so GPU copy can overlap with host accumulation of previous
+        // chunk.
         CUDA_CHECK(cudaMemcpyAsync(ws->vp_d2h_buffer[cur], ws->d_vp + offset_cur,
                                    elems_cur * sizeof(float), cudaMemcpyDeviceToHost,
                                    copy_streams[cur]));
@@ -495,11 +487,6 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
                                        PPForceWorkspace* ws, float* f2max_t_, float vmax_t_[3],
                                        double* ptotal, double* ttotal) {
     struct timespec t_total0, t_total1;
-    struct timespec t_reorder0, t_reorder1, t_h2d0, t_h2d1, t_sort0, t_sort1;
-    struct timespec t_cell0, t_cell1, t_pp0, t_pp1, t_upd0, t_upd1, t_d2h0, t_d2h1;
-    double dt_reorder = 0.0, dt_h2d = 0.0, dt_sort = 0.0;
-    double dt_cell = 0.0, dt_pp = 0.0, dt_upd = 0.0, dt_d2h = 0.0;
-    const int timing = pp_timing_level();
     clock_gettime(CLOCK_MONOTONIC, &t_total0);
 
     float pp_range = apm3[iapm - 1];
@@ -543,8 +530,6 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         }
     }
 
-    if (timing >= 2) clock_gettime(CLOCK_MONOTONIC, &t_reorder0);
-
     int nk = (nc2_offset[2] + 1) - (nc1_offset[2] - 1) + 1;
     int nj = (nc2_offset[1] + 1) - (nc1_offset[1] - 1) + 1;
     int ni = (nc2_offset[0] + 1) - (nc1_offset[0] - 1) + 1;
@@ -560,7 +545,7 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     std::vector<int> count(ncell);
     std::vector<int64_t> offset(ncell);
 
-    #pragma omp parallel for collapse(3) num_threads(ncore)
+#pragma omp parallel for collapse(3) num_threads(ncore)
     for (int k = nc1_offset[2] - 1; k <= nc2_offset[2] + 1; k++) {
         for (int j = nc1_offset[1] - 1; j <= nc2_offset[1] + 1; j++) {
             for (int i = nc1_offset[0] - 1; i <= nc2_offset[0] + 1; i++) {
@@ -574,7 +559,7 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     for (int c = 1; c < ncell; c++) offset[c] = offset[c - 1] + count[c - 1];
     int64_t total = offset[ncell - 1] + count[ncell - 1];
 
-    #pragma omp parallel for collapse(3) num_threads(ncore)
+#pragma omp parallel for collapse(3) num_threads(ncore)
     for (int k = nc1_offset[2] - 1; k <= nc2_offset[2] + 1; k++) {
         for (int j = nc1_offset[1] - 1; j <= nc2_offset[1] + 1; j++) {
             for (int i = nc1_offset[0] - 1; i <= nc2_offset[0] + 1; i++) {
@@ -624,57 +609,44 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     }
 
     int N = (int)total;
-    if (timing >= 2) {
-        clock_gettime(CLOCK_MONOTONIC, &t_reorder1);
-        dt_reorder = elapsed_sec(t_reorder0, t_reorder1);
-        clock_gettime(CLOCK_MONOTONIC, &t_h2d0);
-    }
     if (N > ws->n_cap) {
         fprintf(stderr, "N=%d exceeds workspace n_cap=%d (np_tile_max)\n", N, ws->n_cap);
         exit(EXIT_FAILURE);
     }
 
-    CUDA_CHECK(
-        cudaMemcpyAsync(ws->d_keys, ws->keys_h, (size_t)N * sizeof(uint32_t), cudaMemcpyHostToDevice, ws->h2d_stream));
-    CUDA_CHECK(
-        cudaMemcpyAsync(ws->d_values, ws->values_h, (size_t)N * sizeof(uint32_t), cudaMemcpyHostToDevice, ws->h2d_stream));
-    CUDA_CHECK(cudaMemcpyAsync(ws->d_xf0, ws->xf0_h, (size_t)N * sizeof(float), cudaMemcpyHostToDevice, ws->h2d_stream));
-    CUDA_CHECK(cudaMemcpyAsync(ws->d_xf1, ws->xf1_h, (size_t)N * sizeof(float), cudaMemcpyHostToDevice, ws->h2d_stream));
-    CUDA_CHECK(cudaMemcpyAsync(ws->d_xf2, ws->xf2_h, (size_t)N * sizeof(float), cudaMemcpyHostToDevice, ws->h2d_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_keys, ws->keys_h, (size_t)N * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_values, ws->values_h, (size_t)N * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_xf0, ws->xf0_h, (size_t)N * sizeof(float),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_xf1, ws->xf1_h, (size_t)N * sizeof(float),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_xf2, ws->xf2_h, (size_t)N * sizeof(float),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
 
     cudaStreamWaitEvent(ws->h2d_stream, ws->event_reduce_done, 0);
 
     CUDA_CHECK(cudaMemcpyAsync(ws->d_ip_local, ws->ip_local_h, (size_t)N * sizeof(int64_t),
-                          cudaMemcpyHostToDevice, ws->h2d_stream));
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
 
     CUDA_CHECK(cudaMemsetAsync(ws->d_af0, 0, (size_t)N * sizeof(float), ws->h2d_stream));
     CUDA_CHECK(cudaMemsetAsync(ws->d_af1, 0, (size_t)N * sizeof(float), ws->h2d_stream));
     CUDA_CHECK(cudaMemsetAsync(ws->d_af2, 0, (size_t)N * sizeof(float), ws->h2d_stream));
-    if (timing >= 2) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_h2d1);
-        dt_h2d = elapsed_sec(t_h2d0, t_h2d1);
-        clock_gettime(CLOCK_MONOTONIC, &t_sort0);
-    }
 
     cudaEventRecord(ws->event_h2d_done, ws->h2d_stream);
     cudaStreamWaitEvent(ws->compute_stream, ws->event_h2d_done, 0);
 
-    auto exec = thrust::cuda::par(thrust::detail::single_device_tls_caching_allocator()).on(ws->compute_stream);
+    auto exec = thrust::cuda::par(thrust::detail::single_device_tls_caching_allocator())
+                    .on(ws->compute_stream);
 
     // -------------------------
-    // thrust sort_by_key(keys, values)
+    // thrust sort
     // -------------------------
     {
         thrust::device_ptr<uint32_t> kptr(ws->d_keys);
         thrust::device_ptr<uint32_t> vptr(ws->d_values);
         thrust::sort_by_key(exec, kptr, kptr + N, vptr);
-    }
-
-    // -------------------------
-    // gather xf -> xf_sorted
-    // -------------------------
-    {
         thrust::device_ptr<uint32_t> map(ws->d_values);
         thrust::device_ptr<float> in0(ws->d_xf0), in1(ws->d_xf1), in2(ws->d_xf2);
         thrust::device_ptr<float> out0(ws->d_xf0_sorted), out1(ws->d_xf1_sorted),
@@ -683,26 +655,21 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         thrust::gather(exec, map, map + N, in1, out1);
         thrust::gather(exec, map, map + N, in2, out2);
     }
-    if (timing >= 2) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_sort1);
-        dt_sort = elapsed_sec(t_sort0, t_sort1);
-        clock_gettime(CLOCK_MONOTONIC, &t_cell0);
-    }
 
     // -------------------------
     // build cell ranges
     // -------------------------
-    int grid_num = (npgrid + 2 * rcp) * (npgrid + 2 * rcp) * (npgrid + 2 * rcp);
-    if (grid_num > ws->grid_num_cap) {
-        fprintf(stderr, "grid_num=%d exceeds workspace grid_num_cap=%d\n", grid_num,
-                ws->grid_num_cap);
-        exit(EXIT_FAILURE);
-    }
-    CUDA_CHECK(cudaMemsetAsync(ws->d_cell_start, 0xFF, (size_t)grid_num * sizeof(int), ws->compute_stream));
-    CUDA_CHECK(cudaMemsetAsync(ws->d_cell_end, 0xFF, (size_t)grid_num * sizeof(int), ws->compute_stream));
-
     {
+        int grid_num = (npgrid + 2 * rcp) * (npgrid + 2 * rcp) * (npgrid + 2 * rcp);
+        if (grid_num > ws->grid_num_cap) {
+            fprintf(stderr, "grid_num=%d exceeds workspace grid_num_cap=%d\n", grid_num,
+                    ws->grid_num_cap);
+            exit(EXIT_FAILURE);
+        }
+        CUDA_CHECK(cudaMemsetAsync(ws->d_cell_start, 0xFF, (size_t)grid_num * sizeof(int),
+                                ws->compute_stream));
+        CUDA_CHECK(
+            cudaMemsetAsync(ws->d_cell_end, 0xFF, (size_t)grid_num * sizeof(int), ws->compute_stream));
         const int blocks = (N + kCellBuildThreads - 1) / kCellBuildThreads;
         build_cell_start_end_kernel<<<blocks, kCellBuildThreads, 0, ws->compute_stream>>>(
             ws->d_keys, N, ws->d_cell_start, ws->d_cell_end);
@@ -719,14 +686,9 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         auto rend_begin = thrust::make_reverse_iterator(end_ptr + grid_num);
         auto rend_end = thrust::make_reverse_iterator(end_ptr);
 
-        thrust::inclusive_scan(exec, rstart_begin, rstart_end, rstart_begin, thrust::minimum<int>());
+        thrust::inclusive_scan(exec, rstart_begin, rstart_end, rstart_begin,
+                               thrust::minimum<int>());
         thrust::inclusive_scan(exec, rend_begin, rend_end, rend_begin, thrust::minimum<int>());
-    }
-    if (timing >= 2) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_cell1);
-        dt_cell = elapsed_sec(t_cell0, t_cell1);
-        clock_gettime(CLOCK_MONOTONIC, &t_pp0);
     }
 
     // -------------------------
@@ -739,100 +701,55 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
             ws->d_cell_start, ws->d_cell_end, ws->d_af0, ws->d_af1, ws->d_af2);
         CUDA_CHECK(cudaGetLastError());
     }
-    if (timing >= 2) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_pp1);
-        dt_pp = elapsed_sec(t_pp0, t_pp1);
-        clock_gettime(CLOCK_MONOTONIC, &t_upd0);
-    }
 
     // -------------------------
-    // update vp + reduce block max
+    // update vp + reduce max
     // -------------------------
-    int upd_blocks = (N + kUpdateThreads - 1) / kUpdateThreads;
-    if (upd_blocks > ws->upd_blocks_cap) {
-        fprintf(stderr, "upd_blocks=%d exceeds workspace upd_blocks_cap=%d\n", upd_blocks,
-                ws->upd_blocks_cap);
-        exit(EXIT_FAILURE);
-    }
-
     {
+        int upd_blocks = (N + kUpdateThreads - 1) / kUpdateThreads;
+        if (upd_blocks > ws->upd_blocks_cap) {
+            fprintf(stderr, "upd_blocks=%d exceeds workspace upd_blocks_cap=%d\n", upd_blocks,
+                    ws->upd_blocks_cap);
+            exit(EXIT_FAILURE);
+        }
         CUDA_CHECK(cudaMemsetAsync(ws->d_f2_out, 0, sizeof(float), ws->compute_stream));
         CUDA_CHECK(cudaMemsetAsync(ws->d_v0_out, 0, sizeof(float), ws->compute_stream));
         CUDA_CHECK(cudaMemsetAsync(ws->d_v1_out, 0, sizeof(float), ws->compute_stream));
         CUDA_CHECK(cudaMemsetAsync(ws->d_v2_out, 0, sizeof(float), ws->compute_stream));
         size_t shmem = (size_t)kUpdateThreads * 4 * sizeof(float);
         update_v_kernel<<<upd_blocks, kUpdateThreads, shmem, ws->compute_stream>>>(
-                ws->d_af0, ws->d_af1, ws->d_af2, ws->d_ip_local,
-                ws->d_values,
-                d_vp_flat, N, mass_p_cdm * mass_p_cdm, a_mid, dt,
-                ws->d_f2_out, ws->d_v0_out, ws->d_v1_out, ws->d_v2_out);
+            ws->d_af0, ws->d_af1, ws->d_af2, ws->d_ip_local, ws->d_values, d_vp_flat, N,
+            mass_p_cdm * mass_p_cdm, a_mid, dt, ws->d_f2_out, ws->d_v0_out, ws->d_v1_out,
+            ws->d_v2_out);
         CUDA_CHECK(cudaGetLastError());
         cudaEventRecord(ws->event_reduce_done, ws->compute_stream);
     }
-    if (timing >= 2) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_upd1);
-        dt_upd = elapsed_sec(t_upd0, t_upd1);
-        clock_gettime(CLOCK_MONOTONIC, &t_d2h0);
-    }
 
-    // CUDA_CHECK(cudaDeviceSynchronize());
     cudaStreamWaitEvent(ws->d2h_stream, ws->event_reduce_done, 0);
 
-    CUDA_CHECK(cudaMemcpyAsync(f2max_t_, ws->d_f2_out, sizeof(float), cudaMemcpyDeviceToHost, ws->d2h_stream));
-    CUDA_CHECK(cudaMemcpyAsync(vmax_t_, ws->d_v0_out, sizeof(float), cudaMemcpyDeviceToHost, ws->d2h_stream));
-    CUDA_CHECK(cudaMemcpyAsync(vmax_t_ + 1, ws->d_v1_out, sizeof(float), cudaMemcpyDeviceToHost, ws->d2h_stream));
-    CUDA_CHECK(cudaMemcpyAsync(vmax_t_ + 2, ws->d_v2_out, sizeof(float), cudaMemcpyDeviceToHost, ws->d2h_stream));
-
-    if (timing >= 2) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_d2h1);
-        dt_d2h = elapsed_sec(t_d2h0, t_d2h1);
-    }
+    CUDA_CHECK(cudaMemcpyAsync(f2max_t_, ws->d_f2_out, sizeof(float), cudaMemcpyDeviceToHost,
+                               ws->d2h_stream));
+    CUDA_CHECK(cudaMemcpyAsync(vmax_t_, ws->d_v0_out, sizeof(float), cudaMemcpyDeviceToHost,
+                               ws->d2h_stream));
+    CUDA_CHECK(cudaMemcpyAsync(vmax_t_ + 1, ws->d_v1_out, sizeof(float), cudaMemcpyDeviceToHost,
+                               ws->d2h_stream));
+    CUDA_CHECK(cudaMemcpyAsync(vmax_t_ + 2, ws->d_v2_out, sizeof(float), cudaMemcpyDeviceToHost,
+                               ws->d2h_stream));
 
     ptotal[itile] = (double)nptile_real;
-
     clock_gettime(CLOCK_MONOTONIC, &t_total1);
     ttotal[itile] = elapsed_sec(t_total0, t_total1);
-    if (timing >= 2) {
-        fprintf(
-            stderr,
-            "[PP-TILE] itile=%d iapm=%d N=%d nptile_real=%d total=%.6fs reorder=%.6fs h2d=%.6fs "
-            "sort=%.6fs cell=%.6fs pp=%.6fs update=%.6fs d2h=%.6fs\n",
-            itile, iapm, N, nptile_real, ttotal[itile], dt_reorder, dt_h2d, dt_sort, dt_cell, dt_pp,
-            dt_upd, dt_d2h);
-    }
 }
 
 extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][6], float apm3[7],
                                   int ratio_sf[7], int* _rhoc, int64_t* _idx_b_r, int16_t* _xp,
                                   float* _vp, float mass_p_cdm, float a_mid, float dt, float* f2max,
                                   float vmax[3], double* ptotal, double* ttotal) {
-    struct timespec t_total0, t_total1, t_h2d0, t_h2d1, t_tile0, t_tile1, t_d2h0, t_d2h1;
-    double dt_h2d = 0.0, dt_tiles = 0.0, dt_d2h = 0.0;
-    const int timing = pp_timing_level();
-    if (timing >= 1) clock_gettime(CLOCK_MONOTONIC, &t_total0);
+    // here we assume ires is the same for all tiles, share same rcp;
+    int rcp = ratio_sf[ires[0] - 1];
+    PPForceWorkspace* ws = get_pp_workspace_static(rcp);
 
-    int max_rcp = ratio_sf[0];
-    for (int i = 1; i < 7; i++) {
-        if (ratio_sf[i] > max_rcp) max_rcp = ratio_sf[i];
-    }
-    PPForceWorkspace* ws = get_pp_workspace_static(max_rcp);
-
-    // move vp to device memory once
-    if (timing >= 1) clock_gettime(CLOCK_MONOTONIC, &t_h2d0);
-    // CUDA_CHECK(cudaMemcpy(ws->d_vp, _vp, N_vp, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(ws->d_vp, 0, N_vp));
-    if (timing >= 1) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_h2d1);
-        dt_h2d = elapsed_sec(t_h2d0, t_h2d1);
-        clock_gettime(CLOCK_MONOTONIC, &t_tile0);
-    }
-
-    CUDA_CHECK(cudaMemset(ws->f2max_teams, 0, (size_t)nnt * nnt * nnt * sizeof(float)));
-    CUDA_CHECK(cudaMemset(ws->vmax_teams, 0, (size_t)nnt * nnt * nnt * 3 * sizeof(float)));
 
     for (int it = 0; it < nnt * nnt * nnt; it++) {
         int itile = it;
@@ -844,13 +761,8 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
         int nc2[3] = {nt, nt, nt};
 
         c_pp_force_kernel_tile(itile, iapm, tile1, nc1, nc2, utile_shift, ratio_sf, apm3, _rhoc,
-                               _idx_b_r, _xp, ws->d_vp, mass_p_cdm, a_mid, dt, ws, &(ws->f2max_teams[it]),
-                               ws->vmax_teams + 3 * it, ptotal, ttotal);
-    }
-    if (timing >= 1) {
-        clock_gettime(CLOCK_MONOTONIC, &t_tile1);
-        dt_tiles = elapsed_sec(t_tile0, t_tile1);
-        clock_gettime(CLOCK_MONOTONIC, &t_d2h0);
+                               _idx_b_r, _xp, ws->d_vp, mass_p_cdm, a_mid, dt, ws,
+                               &(ws->f2max_teams[it]), ws->vmax_teams + 3 * it, ptotal, ttotal);
     }
 
     float _f2max = 0.0f;
@@ -871,16 +783,4 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
     vmax[2] = _vmax2;
 
     accumulate_vp_from_device(ws, _vp);
-
-    if (timing >= 1) {
-        CUDA_CHECK(cudaDeviceSynchronize());
-        clock_gettime(CLOCK_MONOTONIC, &t_d2h1);
-        dt_d2h = elapsed_sec(t_d2h0, t_d2h1);
-        clock_gettime(CLOCK_MONOTONIC, &t_total1);
-        fprintf(stderr,
-                "[PP] total=%.6fs vp_h2d=%.6fs tiles=%.6fs vp_d2h=%.6fs f2max=%.6e vmax=(%.6e, "
-                "%.6e, %.6e)\n",
-                elapsed_sec(t_total0, t_total1), dt_h2d, dt_tiles, dt_d2h, (double)(*f2max),
-                (double)vmax[0], (double)vmax[1], (double)vmax[2]);
-    }
 }
