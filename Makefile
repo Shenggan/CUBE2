@@ -39,7 +39,7 @@ pp_force_kernel.o: pp_force_kernel.c
 # 	gcc -O3 -fopenmp -c pp_force_kernel.c -o pp_force_kernel.o
 
 pp_force_kernel_cuda.o: pp_force_kernel.cu
-	nvcc -O3 -Xcompiler -fopenmp -c pp_force_kernel.cu -o pp_force_kernel_cuda.o
+	nvcc -O3 -arch=sm_80 -use_fast_math -Xcompiler -fopenmp -c pp_force_kernel.cu -o pp_force_kernel_cuda.o
 
 clean:
 	rm -f *.mod *.o *.out *.err *.x *~
