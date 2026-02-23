@@ -43,7 +43,7 @@ const int64_t np_image_max = np_image * ((int64_t)nte * 1.0 / (int64_t)nt) *
                              ((int64_t)nte * 1.0 / (int64_t)nt) * image_buffer;
 const int64_t np_tile_max = np_image / (nnt * nnt * nnt) *
                             ((nte * 1.0 / nt) * (nte * 1.0 / nt) * (nte * 1.0 / nt)) * tile_buffer;
-const size_t N_vp = (size_t)np_image_max * 3 * sizeof(float);
+const size_t max_vp = (size_t)np_image_max * 3;
 const size_t VP_CHUNK_ELEMS = 400 * 1024 * 1024;
 
 const int64_t ishift = -((int64_t)1 << 15);  // 2^15
@@ -290,7 +290,7 @@ struct PPForceWorkspace {
     float* vmax_teams;
     float* vp_d2h_buffer[2];
 
-    int rcp;
+    int max_rcp;
     int n_cap;
     int grid_num_cap;
     int upd_blocks_cap;
@@ -303,14 +303,14 @@ struct PPForceWorkspace {
     cudaEvent_t event_reduce_done;
 };
 
-static void init_pp_workspace(PPForceWorkspace* ws, int rcp) {
+static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
     memset(ws, 0, sizeof(*ws));
 
-    ws->rcp = rcp;
+    ws->max_rcp = max_rcp;
     ws->n_cap = (int)np_tile_max;
     ws->upd_blocks_cap = (ws->n_cap + kUpdateThreads - 1) / kUpdateThreads;
 
-    int stride = nt * rcp + 2 * rcp;
+    int stride = nt * max_rcp + 2 * max_rcp;
     ws->grid_num_cap = stride * stride * stride;
 
     CUDA_CHECK(cudaMallocHost(&ws->xf0_h, ws->n_cap * sizeof(float)));
@@ -343,7 +343,7 @@ static void init_pp_workspace(PPForceWorkspace* ws, int rcp) {
     CUDA_CHECK(cudaMalloc(&ws->d_v0_out, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws->d_v1_out, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws->d_v2_out, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws->d_vp, N_vp));
+    CUDA_CHECK(cudaMalloc(&ws->d_vp, max_vp * sizeof(float)));
 
     CUDA_CHECK(cudaStreamCreate(&ws->h2d_stream));
     CUDA_CHECK(cudaStreamCreate(&ws->d2h_stream));
@@ -414,24 +414,23 @@ static void pp_ws_atexit_cleanup() {
     }
 }
 
-static inline PPForceWorkspace* get_pp_workspace_static(int rcp) {
+static inline PPForceWorkspace* get_pp_workspace_static(int max_rcp) {
     if (!g_pp_ws_inited) {
-        init_pp_workspace(&g_pp_ws, rcp);
+        init_pp_workspace(&g_pp_ws, max_rcp);
         g_pp_ws_inited = 1;
         atexit(pp_ws_atexit_cleanup);
     } else {
-        if (g_pp_ws.rcp != rcp) {
-            fprintf(stderr, "[PP] rcp changed: old=%d new=%d (static ws, no resize)\n",
-                    g_pp_ws.rcp, rcp);
+        if (g_pp_ws.max_rcp != max_rcp) {
+            fprintf(stderr, "[PP] max_rcp changed: old=%d new=%d (static ws, no resize)\n",
+                    g_pp_ws.max_rcp, max_rcp);
             exit(EXIT_FAILURE);
         }
     }
     return &g_pp_ws;
 }
 
-static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out) {
-    // N_vp is byte-size; convert to float element count before chunking.
-    const size_t vp_elems = N_vp / sizeof(float);
+static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out, size_t vp_elems_used) {
+    const size_t vp_elems = vp_elems_used;
     const size_t chunk_elems = VP_CHUNK_ELEMS;
     const size_t num_chunks = (vp_elems + chunk_elems - 1) / chunk_elems;
     if (num_chunks == 0) return;
@@ -745,11 +744,13 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
                                   int ratio_sf[7], int* _rhoc, int64_t* _idx_b_r, int16_t* _xp,
                                   float* _vp, float mass_p_cdm, float a_mid, float dt, float* f2max,
                                   float vmax[3], double* ptotal, double* ttotal) {
-    // here we assume ires is the same for all tiles, share same rcp;
-    int rcp = ratio_sf[ires[0] - 1];
-    PPForceWorkspace* ws = get_pp_workspace_static(rcp);
+    int max_rcp = ratio_sf[0];
+    for (int i = 1; i < 7; i++) {
+        if (ratio_sf[i] > max_rcp) max_rcp = ratio_sf[i];
+    }
+    PPForceWorkspace* ws = get_pp_workspace_static(max_rcp);
 
-    CUDA_CHECK(cudaMemset(ws->d_vp, 0, N_vp));
+    CUDA_CHECK(cudaMemset(ws->d_vp, 0, max_vp * sizeof(float)));
 
     for (int it = 0; it < nnt * nnt * nnt; it++) {
         int itile = it;
@@ -782,5 +783,13 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
     vmax[1] = _vmax1;
     vmax[2] = _vmax2;
 
-    accumulate_vp_from_device(ws, _vp);
+    int64_t (*idx_b_r)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb] =
+        (int64_t (*)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb]) _idx_b_r;
+    const int j_last = nt + 2 * ncb - 1;
+    const int k_last = nt + 2 * ncb - 1;
+    int64_t n_used = idx_b_r[nnt - 1][nnt - 1][nnt - 1][k_last][j_last]; // particle count
+    size_t vp_elems_used = (size_t)n_used * 3;
+    if (vp_elems_used > max_vp) vp_elems_used = max_vp;
+
+    accumulate_vp_from_device(ws, _vp, vp_elems_used);
 }
