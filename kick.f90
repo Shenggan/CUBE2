@@ -167,7 +167,7 @@ subroutine kick
     call tic(14)
     vmax=0; f2max=0; pt=0
     
-    allocate(ptotal(nnt*nnt*nnt),ttotal(nnt*nnt*nnt))
+    allocate(ptotal(ns3),ttotal(ns3))
     call c_pp_force_kernel(isort, ires, ixyz3, apm3, ratio_sf, &
                            rhoc, idx_b_r, xp, vp, &
                            sim%mass_p_cdm, a_mid, dt, &

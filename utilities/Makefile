@@ -8,7 +8,7 @@ OBJFILE:=$(addprefix ,$(notdir $(MODEFILE:.f90=.o)))
 
 XFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
 OFLAG=-O3 -fpp -qopenmp -coarray=distributed -mcmodel=large -coarray-num-images=1
-FFTFLAG=-I${MKLROOT}/include/fftw/ -qmkl
+FFTFLAG=-I${MKLROOT}/include/fftw/ -qmkl -latomic
 
 all: ic.x cicpower.x fof.x fof_merge.x #write_gadget_format.x dsp.x
 	@echo "made:" $^

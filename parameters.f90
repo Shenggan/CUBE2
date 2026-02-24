@@ -2,7 +2,7 @@ module parameters
   implicit none
   
   ! output directory
-  character(*),parameter :: opath='/home/nus-csg/CUBE2/out/cbh/1000_128/'
+  character(*),parameter :: opath='/data/home/csg/workspace/CUBE2/out/cbh/1000_128/'
 
   ! zip parameters
   integer,parameter :: ndim=3

@@ -1,4 +1,6 @@
 #include <cuda_runtime.h>
+#include "cuda_parameters_generated.h"
+#include <limits.h>
 #include <math.h>
 #include <math_constants.h>
 #include <stdint.h>
@@ -15,29 +17,32 @@
 #include <thrust/sort.h>
 #include <time.h>
 
+#include <algorithm>
 #include <vector>
 
 // -------------------------
 // Global configuration
 // -------------------------
-const int ng = 512;
-const int nnt = 4;
-const int nns = 4;
-const int ratio_cs = 4;
+const int ng = CUBE_NG;
+const int nnt = CUBE_NNT;
+const int nns = CUBE_NNS;
+const int ratio_cs = CUBE_RATIO_CS;
 const int nc = ng / ratio_cs;
-const int np_nc = ratio_cs;
+const int np_nc = CUBE_NP_NC;
 const int nt = nc / nnt;
 const int ntt = nt / nns;
-const int ngb = 16;
+const int ngb = CUBE_NGB;
 const int ncb = ngb / ratio_cs;
 const int nte = nt + 2 * ncb;
 const int ns3 = (nnt * nns) * (nnt * nns) * (nnt * nns);
 
-const bool body_centered_cubic = false;
-const int image_buffer = 2;
-const int tile_buffer = 3;
+const bool body_centered_cubic = CUBE_BODY_CENTERED_CUBIC;
+const double image_buffer = CUBE_IMAGE_BUFFER;
+const double tile_buffer = CUBE_TILE_BUFFER;
 
-const int64_t np_image = (nc * np_nc) * (nc * np_nc) * (nc * np_nc) * (1 + body_centered_cubic);
+const int64_t np_image =
+    (int64_t)(nc * np_nc) * (nc * np_nc) * (nc * np_nc) *
+    (1 + body_centered_cubic);
 const int64_t np_image_max = np_image * ((int64_t)nte * 1.0 / (int64_t)nt) *
                              ((int64_t)nte * 1.0 / (int64_t)nt) *
                              ((int64_t)nte * 1.0 / (int64_t)nt) * image_buffer;
@@ -50,9 +55,9 @@ const int64_t ishift = -((int64_t)1 << 15);  // 2^15
 const double rshift = 0.5 - ishift;
 const double x_resolution = 1.0 / ((int64_t)1 << 16);
 
-const double app = 0.06;
+const double app = CUBE_APP;
 
-const int ncore = 32;
+const int ncore = CUBE_NCORE;
 
 const int kCellBuildThreads = 256;
 const int kUpdateThreads = 256;
@@ -132,33 +137,34 @@ __device__ __forceinline__ void atomicMaxFloatNonNeg(float* addr, float val) {
 }
 
 __global__ void pp_force_kernel(const float* __restrict__ xf0, const float* __restrict__ xf1,
-                                const float* __restrict__ xf2, int npgrid, int rcp, float pp_range,
+                                const float* __restrict__ xf2, const float* __restrict__ pp_range,
+                                const uint8_t* __restrict__ active, const uint32_t* __restrict__ keys,
+                                int N, int npgrid, int rcp,
                                 float app_local, const int* __restrict__ cell_start,
                                 const int* __restrict__ cell_end, float* __restrict__ af0,
                                 float* __restrict__ af1, float* __restrict__ af2) {
-    int cell = blockIdx.x;  // 0..npgrid^3-1
-    int cells2 = npgrid * npgrid;
-    int k = cell / cells2;
-    int j = (cell / npgrid) % npgrid;
-    int i = cell % npgrid;
-
     int stride = (npgrid + 2 * rcp);
-    int idx = (k + rcp) * stride * stride + (j + rcp) * stride + (i + rcp);
-
-    int o0 = cell_start[idx];
-    int o1 = cell_end[idx];
-
-    float pp2 = pp_range * pp_range;
-
-    for (int outer = o0 + threadIdx.x; outer < o1; outer += blockDim.x) {
+    int outer = blockIdx.x * blockDim.x + threadIdx.x;
+    if (outer < N) {
+        if (!active[outer]) return;
+        const int key = (int)keys[outer];
+        const int k = key / (stride * stride) - rcp;
+        const int j = (key / stride) % stride - rcp;
+        const int i = key % stride - rcp;
         float xo = xf0[outer], yo = xf1[outer], zo = xf2[outer];
         float ax = 0.f, ay = 0.f, az = 0.f;
+        float outer_range = pp_range[outer];
+        float pp2 = outer_range * outer_range;
+        const int outer_cell_radius = (int)ceilf(outer_range * (float)rcp / (float)ratio_cs);
 
-        for (int kk = -1; kk <= 1; kk++) {
+        for (int kk = -outer_cell_radius; kk <= outer_cell_radius; kk++) {
             // #pragma unroll
-            for (int jj = -1; jj <= 1; jj++) {
+            for (int jj = -outer_cell_radius; jj <= outer_cell_radius; jj++) {
                 // #pragma unroll
-                for (int ii = -1; ii <= 1; ii++) {
+                for (int ii = -outer_cell_radius; ii <= outer_cell_radius; ii++) {
+                    if (k + kk < -rcp || k + kk >= npgrid + rcp || j + jj < -rcp ||
+                        j + jj >= npgrid + rcp || i + ii < -rcp || i + ii >= npgrid + rcp)
+                        continue;
                     int nidx =
                         (k + kk + rcp) * stride * stride + (j + jj + rcp) * stride + (i + ii + rcp);
 
@@ -174,7 +180,7 @@ __global__ void pp_force_kernel(const float* __restrict__ xf0, const float* __re
                         if (r2 > 0.0f && r2 < pp2) {
                             float invr = rsqrtf(r2);
                             float r = r2 * invr;
-                            float fpp = F_ra_dev(r, app_local) - F_ra_dev(r, pp_range);
+                            float fpp = F_ra_dev(r, app_local) - F_ra_dev(r, outer_range);
                             ax += fpp * dx * invr;
                             ay += fpp * dy * invr;
                             az += fpp * dz * invr;
@@ -191,10 +197,11 @@ __global__ void pp_force_kernel(const float* __restrict__ xf0, const float* __re
 }
 
 __global__ void update_v_kernel(const float* __restrict__ af0, const float* __restrict__ af1,
-                                const float* __restrict__ af2, const int64_t* __restrict__ ip_local,
+                                const float* __restrict__ af2, const uint32_t* __restrict__ ip_local,
                                 const uint32_t* __restrict__ values_sorted,
                                 float* __restrict__ vp_flat, int N, float mass2, float a_mid,
-                                float dt, float* __restrict__ f2_global) {
+                                float dt, const uint8_t* __restrict__ active,
+                                float* __restrict__ f2_global) {
     extern __shared__ float s[];
     float* sf2 = s;
 
@@ -203,7 +210,7 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
 
     float f2 = 0.f;
 
-    if (idx < N) {
+    if (idx < N && active[idx]) {
         float ax = af0[idx] * mass2;
         float ay = af1[idx] * mass2;
         float az = af2[idx] * mass2;
@@ -211,7 +218,7 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
         f2 = ax * ax + ay * ay + az * az;
 
         uint32_t ori = values_sorted[idx];
-        int64_t ip = ip_local[ori];
+        uint32_t ip = ip_local[ori];
 
         const float coef = a_mid * dt / (6.0f * CUDART_PI_F);
 
@@ -252,7 +259,11 @@ struct PPForceWorkspace {
     float* d_af0;
     float* d_af1;
     float* d_af2;
-    int64_t* d_ip_local;
+    float* d_pp_range;
+    float* d_pp_range_sorted;
+    uint32_t* d_ip_local;
+    uint8_t* d_active;
+    uint8_t* d_active_sorted;
     int* d_cell_start;
     int* d_cell_end;
     float* d_f2_out;
@@ -261,9 +272,11 @@ struct PPForceWorkspace {
     float* xf0_h;
     float* xf1_h;
     float* xf2_h;
-    int64_t* ip_local_h;
+    uint32_t* ip_local_h;
     uint32_t* keys_h;
     uint32_t* values_h;
+    float* pp_range_h;
+    uint8_t* active_h;
 
     float* f2max_teams;
     float* vmax_teams;
@@ -295,9 +308,11 @@ static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
     CUDA_CHECK(cudaMallocHost(&ws->xf0_h, ws->n_cap * sizeof(float)));
     CUDA_CHECK(cudaMallocHost(&ws->xf1_h, ws->n_cap * sizeof(float)));
     CUDA_CHECK(cudaMallocHost(&ws->xf2_h, ws->n_cap * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(&ws->ip_local_h, ws->n_cap * sizeof(int64_t)));
+    CUDA_CHECK(cudaMallocHost(&ws->ip_local_h, ws->n_cap * sizeof(uint32_t)));
     CUDA_CHECK(cudaMallocHost(&ws->keys_h, ws->n_cap * sizeof(uint32_t)));
     CUDA_CHECK(cudaMallocHost(&ws->values_h, ws->n_cap * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMallocHost(&ws->pp_range_h, ws->n_cap * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&ws->active_h, ws->n_cap * sizeof(uint8_t)));
 
     CUDA_CHECK(cudaMallocHost(&ws->f2max_teams, (size_t)nnt * nnt * nnt * sizeof(float)));
     CUDA_CHECK(cudaMallocHost(&ws->vmax_teams, (size_t)nnt * nnt * nnt * 3 * sizeof(float)));
@@ -315,7 +330,11 @@ static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
     CUDA_CHECK(cudaMalloc(&ws->d_af0, (size_t)ws->n_cap * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws->d_af1, (size_t)ws->n_cap * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws->d_af2, (size_t)ws->n_cap * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws->d_ip_local, (size_t)ws->n_cap * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&ws->d_pp_range, (size_t)ws->n_cap * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws->d_pp_range_sorted, (size_t)ws->n_cap * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&ws->d_ip_local, (size_t)ws->n_cap * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&ws->d_active, (size_t)ws->n_cap * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&ws->d_active_sorted, (size_t)ws->n_cap * sizeof(uint8_t)));
     CUDA_CHECK(cudaMalloc(&ws->d_cell_start, (size_t)ws->grid_num_cap * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws->d_cell_end, (size_t)ws->grid_num_cap * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws->d_f2_out, sizeof(float)));
@@ -351,6 +370,8 @@ static void destroy_pp_workspace(PPForceWorkspace* ws) {
     CUDA_CHECK(cudaFreeHost(ws->ip_local_h));
     CUDA_CHECK(cudaFreeHost(ws->keys_h));
     CUDA_CHECK(cudaFreeHost(ws->values_h));
+    CUDA_CHECK(cudaFreeHost(ws->pp_range_h));
+    CUDA_CHECK(cudaFreeHost(ws->active_h));
 
     CUDA_CHECK(cudaFreeHost(ws->f2max_teams));
     CUDA_CHECK(cudaFreeHost(ws->vmax_teams));
@@ -368,7 +389,11 @@ static void destroy_pp_workspace(PPForceWorkspace* ws) {
     CUDA_CHECK(cudaFree(ws->d_af0));
     CUDA_CHECK(cudaFree(ws->d_af1));
     CUDA_CHECK(cudaFree(ws->d_af2));
+    CUDA_CHECK(cudaFree(ws->d_pp_range));
+    CUDA_CHECK(cudaFree(ws->d_pp_range_sorted));
     CUDA_CHECK(cudaFree(ws->d_ip_local));
+    CUDA_CHECK(cudaFree(ws->d_active));
+    CUDA_CHECK(cudaFree(ws->d_active_sorted));
     CUDA_CHECK(cudaFree(ws->d_cell_start));
     CUDA_CHECK(cudaFree(ws->d_cell_end));
     CUDA_CHECK(cudaFree(ws->d_f2_out));
@@ -402,7 +427,9 @@ static inline PPForceWorkspace* get_pp_workspace_static(int max_rcp) {
     return &g_pp_ws;
 }
 
-static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out, size_t vp_elems_used, float vmax[3]) {
+static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out,
+                                             const uint8_t* active_particles, size_t vp_elems_used,
+                                             float vmax[3]) {
 
     vmax[0] = 0.0f;
     vmax[1] = 0.0f;
@@ -424,7 +451,9 @@ static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_hos
     offset_prev = 0;
     elems_prev = elems0;
 
-    auto add_vp_chunk = [&vmax](float* __restrict__ dst, const float* __restrict__ src, size_t count) {
+    auto add_vp_chunk = [&vmax, active_particles, vp_host_out](float* __restrict__ dst,
+                                                                 const float* __restrict__ src,
+                                                                 size_t count) {
         const int n = (int)count;
         float _vmax_0 = 0.0f;
         float _vmax_1 = 0.0f;
@@ -432,7 +461,8 @@ static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_hos
 #pragma omp parallel for simd num_threads(ncore) schedule(static) reduction(max : _vmax_0, _vmax_1, _vmax_2)
         for (int i = 0; i < n; i++) {
             dst[i] += src[i];
-            if (src[i] != 0.0f) {
+            const size_t global_component = (size_t)(dst - vp_host_out) + (size_t)i;
+            if (active_particles[global_component / 3]) {
                 float v = fabsf(dst[i]);
                 if (i % 3 == 0) {
                     _vmax_0 = fmaxf(_vmax_0, v);
@@ -473,17 +503,42 @@ static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_hos
     add_vp_chunk(vp_host_out + offset_prev, ws->vp_d2h_buffer[(num_chunks - 1) & 1], elems_prev);
 }
 
-extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc1[3], int nc2[3],
+extern "C" void c_pp_force_kernel_tile(const int ires[ns3], const int subtile_owner[ns3],
+                                       int tile1[3], int nc1[3], int nc2[3],
                                        int utile_shift[3], int ratio_sf[], float apm3[], int* _rhoc,
                                        int64_t* _idx_b_r, int16_t* _xp, float* d_vp_flat,
                                        float mass_p_cdm, float a_mid, float dt,
-                                       PPForceWorkspace* ws, float* f2max_t_,
+                                       PPForceWorkspace* ws, uint8_t* active_particles,
+                                       size_t active_particle_count, float* f2max_t_,
                                        double* ptotal, double* ttotal) {
+    // The pinned staging buffers are shared by all tiles.  Do not overwrite
+    // them while the previous tile's asynchronous H2D copies may still read
+    // from them.
+    CUDA_CHECK(cudaStreamSynchronize(ws->h2d_stream));
+
     struct timespec t_total0, t_total1;
     clock_gettime(CLOCK_MONOTONIC, &t_total0);
 
-    float pp_range = apm3[iapm - 1];
-    int rcp = ratio_sf[iapm - 1];
+    // A tile contains nns^3 PP subtiles.  Use one fine-grid launch for the tile;
+    // each physical particle retains the PP range selected by its own ires entry.
+    int rcp = ratio_sf[1];
+    for (int sz = 0; sz < nns; ++sz) {
+        for (int sy = 0; sy < nns; ++sy) {
+            for (int sx = 0; sx < nns; ++sx) {
+                const int tx = tile1[0] - 1;
+                const int ty = tile1[1] - 1;
+                const int tz = tile1[2] - 1;
+                const int subtile = (((tz * nnt + ty) * nnt + tx) * nns + sz) * nns * nns +
+                                    sy * nns + sx;
+                const int iapm = ires[subtile];
+                if (iapm < 2 || iapm > 6) {
+                    fprintf(stderr, "invalid PP ires=%d for subtile %d\n", iapm, subtile);
+                    exit(EXIT_FAILURE);
+                }
+                rcp = std::max(rcp, ratio_sf[iapm - 1]);
+            }
+        }
+    }
     int npgrid = nt * rcp;
 
     int (*rhoc)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb][nt + 2 * ncb] =
@@ -518,7 +573,14 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     for (int k = nc1_offset[2]; k <= nc2_offset[2]; k++) {
         for (int j = nc1_offset[1]; j <= nc2_offset[1]; j++) {
             for (int i = nc1_offset[0]; i <= nc2_offset[0]; i++) {
-                nptile_real += rhoc[tile1_offset[2]][tile1_offset[1]][tile1_offset[0]][k][j][i];
+                const int sx = (i - nc1_offset[0]) / ntt;
+                const int sy = (j - nc1_offset[1]) / ntt;
+                const int sz = (k - nc1_offset[2]) / ntt;
+                const int subtile = (((tile1_offset[2] * nnt + tile1_offset[1]) * nnt +
+                                      tile1_offset[0]) * nns + sz) * nns * nns + sy * nns + sx;
+                const int np = rhoc[tile1_offset[2]][tile1_offset[1]][tile1_offset[0]][k][j][i];
+                nptile_real += np;
+                ptotal[subtile_owner[subtile]] += (double)np;
             }
         }
     }
@@ -536,7 +598,7 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     };
 
     std::vector<int> count(ncell);
-    std::vector<int64_t> offset(ncell);
+    std::vector<int> offset(ncell);
 
 #pragma omp parallel for collapse(3) num_threads(ncore)
     for (int k = nc1_offset[2] - 1; k <= nc2_offset[2] + 1; k++) {
@@ -550,7 +612,7 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
 
     offset[0] = 0;
     for (int c = 1; c < ncell; c++) offset[c] = offset[c - 1] + count[c - 1];
-    int64_t total = offset[ncell - 1] + count[ncell - 1];
+    int total = offset[ncell - 1] + count[ncell - 1];
 
 #pragma omp parallel for collapse(3) num_threads(ncore)
     for (int k = nc1_offset[2] - 1; k <= nc2_offset[2] + 1; k++) {
@@ -558,21 +620,27 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
             for (int i = nc1_offset[0] - 1; i <= nc2_offset[0] + 1; i++) {
                 int cid = cell_id(k, j, i);
                 int np = count[cid];
-                int64_t base = offset[cid];
+                int base = offset[cid];
 
-                int64_t rhoc_i_sum = 0;
+                int rhoc_i_sum = 0;
                 for (int index = i; index < nt + 2 * ncb; index++) {
                     rhoc_i_sum +=
                         rhoc[tile1_offset[2]][tile1_offset[1]][tile1_offset[0]][k][j][index];
                 }
-                int64_t nzero =
+                const int64_t nzero64 =
                     idx_b_r[tile1_offset[2]][tile1_offset[1]][tile1_offset[0]][k][j] - rhoc_i_sum;
+                if (nzero64 < 0 || nzero64 > INT_MAX) {
+                    fprintf(stderr, "PP particle base index %lld exceeds int32 range\n",
+                            (long long)nzero64);
+                    exit(EXIT_FAILURE);
+                }
+                const int nzero = (int)nzero64;
 
                 for (int l = 0; l < np; l++) {
-                    int64_t ip1 = base + l;
-                    int64_t ip = nzero + l;
+                    const int ip1 = base + l;
+                    const int ip = nzero + l;
 
-                    ws->ip_local_h[ip1] = ip;
+                    ws->ip_local_h[ip1] = (uint32_t)ip;
 
                     float x0 = (float)((i - ncb) +
                                        ((int16_t)(xp[ip][0] + ishift) + rshift) * x_resolution);
@@ -584,6 +652,32 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
                     ws->xf0_h[ip1] = ratio_cs * x0;
                     ws->xf1_h[ip1] = ratio_cs * x1;
                     ws->xf2_h[ip1] = ratio_cs * x2;
+
+                    const bool is_real = i >= nc1_offset[0] && i <= nc2_offset[0] &&
+                                         j >= nc1_offset[1] && j <= nc2_offset[1] &&
+                                         k >= nc1_offset[2] && k <= nc2_offset[2];
+                    ws->active_h[ip1] = is_real;
+                    if (is_real) {
+                        if ((size_t)ip >= active_particle_count) {
+                            fprintf(stderr, "PP particle index %lld exceeds active-particle capacity %zu\n",
+                                    (long long)ip, active_particle_count);
+                            exit(EXIT_FAILURE);
+                        }
+                        active_particles[ip] = 1;
+                        const int sx = (i - nc1_offset[0]) / ntt;
+                        const int sy = (j - nc1_offset[1]) / ntt;
+                        const int sz = (k - nc1_offset[2]) / ntt;
+                        const int tx = tile1[0] - 1;
+                        const int ty = tile1[1] - 1;
+                        const int tz = tile1[2] - 1;
+                        const int subtile = (((tz * nnt + ty) * nnt + tx) * nns + sz) * nns * nns +
+                                            sy * nns + sx;
+                        const int iapm = ires[subtile];
+                        ws->pp_range_h[ip1] = apm3[iapm - 1];
+                    } else {
+                        // Halo particles are interaction sources only.
+                        ws->pp_range_h[ip1] = 0.0f;
+                    }
 
                     int idx_0 = (int)floorf((float)rcp * (x0 - (utile_shift[0] * ntt))) + rcp;
                     int idx_1 = (int)floorf((float)rcp * (x1 - (utile_shift[1] * ntt))) + rcp;
@@ -601,11 +695,15 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         }
     }
 
-    int N = (int)total;
+    int N = total;
     if (N > ws->n_cap) {
         fprintf(stderr, "N=%d exceeds workspace n_cap=%d (np_tile_max)\n", N, ws->n_cap);
         exit(EXIT_FAILURE);
     }
+
+    // Reuse of the single workspace is safe only after the preceding tile's
+    // reduction (and therefore all reads of these buffers) has completed.
+    cudaStreamWaitEvent(ws->h2d_stream, ws->event_reduce_done, 0);
 
     CUDA_CHECK(cudaMemcpyAsync(ws->d_keys, ws->keys_h, (size_t)N * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
@@ -615,17 +713,19 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
                                cudaMemcpyHostToDevice, ws->h2d_stream));
     CUDA_CHECK(cudaMemcpyAsync(ws->d_xf2, ws->xf2_h, (size_t)N * sizeof(float),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
-
-    cudaStreamWaitEvent(ws->h2d_stream, ws->event_reduce_done, 0);
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_pp_range, ws->pp_range_h, (size_t)N * sizeof(float),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_active, ws->active_h, (size_t)N * sizeof(uint8_t),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
 
     CUDA_CHECK(cudaMemcpyAsync(ws->d_values, ws->values_h, (size_t)N * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
-    CUDA_CHECK(cudaMemcpyAsync(ws->d_ip_local, ws->ip_local_h, (size_t)N * sizeof(int64_t),
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_ip_local, ws->ip_local_h, (size_t)N * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
 
-    CUDA_CHECK(cudaMemsetAsync(ws->d_af0, 0, (size_t)N * sizeof(float), ws->h2d_stream));
-    CUDA_CHECK(cudaMemsetAsync(ws->d_af1, 0, (size_t)N * sizeof(float), ws->h2d_stream));
-    CUDA_CHECK(cudaMemsetAsync(ws->d_af2, 0, (size_t)N * sizeof(float), ws->h2d_stream));
+    // CUDA_CHECK(cudaMemsetAsync(ws->d_af0, 0, (size_t)N * sizeof(float), ws->h2d_stream));
+    // CUDA_CHECK(cudaMemsetAsync(ws->d_af1, 0, (size_t)N * sizeof(float), ws->h2d_stream));
+    // CUDA_CHECK(cudaMemsetAsync(ws->d_af2, 0, (size_t)N * sizeof(float), ws->h2d_stream));
 
     cudaEventRecord(ws->event_h2d_done, ws->h2d_stream);
     cudaStreamWaitEvent(ws->compute_stream, ws->event_h2d_done, 0);
@@ -644,9 +744,13 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         thrust::device_ptr<float> in0(ws->d_xf0), in1(ws->d_xf1), in2(ws->d_xf2);
         thrust::device_ptr<float> out0(ws->d_xf0_sorted), out1(ws->d_xf1_sorted),
             out2(ws->d_xf2_sorted);
+        thrust::device_ptr<float> in_range(ws->d_pp_range), out_range(ws->d_pp_range_sorted);
+        thrust::device_ptr<uint8_t> in_active(ws->d_active), out_active(ws->d_active_sorted);
         thrust::gather(exec, map, map + N, in0, out0);
         thrust::gather(exec, map, map + N, in1, out1);
         thrust::gather(exec, map, map + N, in2, out2);
+        thrust::gather(exec, map, map + N, in_range, out_range);
+        thrust::gather(exec, map, map + N, in_active, out_active);
     }
 
     // -------------------------
@@ -672,26 +776,33 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         thrust::device_ptr<int> end_ptr(ws->d_cell_end);
 
         thrust::replace(exec, start_ptr, start_ptr + grid_num, -1, N);
-        thrust::replace(exec, end_ptr, end_ptr + grid_num, -1, N);
+        // `0` is the insertion point before the first populated cell.  A
+        // forward maximum scan then propagates each populated cell's end to
+        // the empty cells immediately following it.
+        thrust::replace(exec, end_ptr, end_ptr + grid_num, -1, 0);
 
         auto rstart_begin = thrust::make_reverse_iterator(start_ptr + grid_num);
         auto rstart_end = thrust::make_reverse_iterator(start_ptr);
-        auto rend_begin = thrust::make_reverse_iterator(end_ptr + grid_num);
-        auto rend_end = thrust::make_reverse_iterator(end_ptr);
-
         thrust::inclusive_scan(exec, rstart_begin, rstart_end, rstart_begin,
                                thrust::minimum<int>());
-        thrust::inclusive_scan(exec, rend_begin, rend_end, rend_begin, thrust::minimum<int>());
+        // For an empty cell, end must be the previous populated cell's end
+        // (and therefore equal its lower bound), not the next cell's end.
+        thrust::inclusive_scan(exec, end_ptr, end_ptr + grid_num, end_ptr,
+                               thrust::maximum<int>());
     }
 
     // -------------------------
     // pp force kernel
     // -------------------------
-    int real_cells = npgrid * npgrid * npgrid;
+    int pp_blocks = (N + kPPThreads - 1) / kPPThreads;
     {
-        pp_force_kernel<<<real_cells, kPPThreads, 0, ws->compute_stream>>>(
-            ws->d_xf0_sorted, ws->d_xf1_sorted, ws->d_xf2_sorted, npgrid, rcp, pp_range, (float)app,
-            ws->d_cell_start, ws->d_cell_end, ws->d_af0, ws->d_af1, ws->d_af2);
+        // Each particle uses the cell radius implied by its own ires.  This
+        // preserves PP_Force's per-subtile cutoff without wasting work on the
+        // largest-radius stencil for high-resolution particles.
+        pp_force_kernel<<<pp_blocks, kPPThreads, 0, ws->compute_stream>>>(
+            ws->d_xf0_sorted, ws->d_xf1_sorted, ws->d_xf2_sorted, ws->d_pp_range_sorted,
+            ws->d_active_sorted, ws->d_keys, N, npgrid, rcp, (float)app, ws->d_cell_start,
+            ws->d_cell_end, ws->d_af0, ws->d_af1, ws->d_af2);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -709,7 +820,7 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
         size_t shmem = (size_t)kUpdateThreads * sizeof(float);
         update_v_kernel<<<upd_blocks, kUpdateThreads, shmem, ws->compute_stream>>>(
             ws->d_af0, ws->d_af1, ws->d_af2, ws->d_ip_local, ws->d_values, d_vp_flat, N,
-            mass_p_cdm * mass_p_cdm, a_mid, dt, ws->d_f2_out);
+            mass_p_cdm * mass_p_cdm, a_mid, dt, ws->d_active_sorted, ws->d_f2_out);
         CUDA_CHECK(cudaGetLastError());
         cudaEventRecord(ws->event_reduce_done, ws->compute_stream);
     }
@@ -719,34 +830,78 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     CUDA_CHECK(cudaMemcpyAsync(f2max_t_, ws->d_f2_out, sizeof(float), cudaMemcpyDeviceToHost,
                                ws->d2h_stream));
 
-    ptotal[itile] = (double)nptile_real;
     clock_gettime(CLOCK_MONOTONIC, &t_total1);
-    ttotal[itile] = elapsed_sec(t_total0, t_total1);
+    // Timing is aggregated per parent tile; particle counts above retain the
+    // original PP-subtile indexing used by kick.f90.
+    const int tile_first_subtile = (((tile1_offset[2] * nnt + tile1_offset[1]) * nnt +
+                                     tile1_offset[0]) * nns) * nns * nns;
+    ttotal[subtile_owner[tile_first_subtile]] = elapsed_sec(t_total0, t_total1);
 }
 
 extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][6], float apm3[7],
                                   int ratio_sf[7], int* _rhoc, int64_t* _idx_b_r, int16_t* _xp,
                                   float* _vp, float mass_p_cdm, float a_mid, float dt, float* f2max,
                                   float vmax[3], double* ptotal, double* ttotal) {
-    int max_rcp = ratio_sf[0];
-    for (int i = 1; i < 7; i++) {
-        if (ratio_sf[i] > max_rcp) max_rcp = ratio_sf[i];
+    if (ng > 512 || np_image_max > INT_MAX || np_tile_max > INT_MAX) {
+        fprintf(stderr,
+                "PP CUDA kernel requires ng <= 512 and int32-safe particle capacities "
+                "(ng=%d, image_max=%lld, tile_max=%lld)\n",
+                ng, (long long)np_image_max, (long long)np_tile_max);
+        exit(EXIT_FAILURE);
     }
+
+    // ires follows the Fortran PP-subtile ordering.  Convert it through ixyz3
+    // rather than assuming the array happens to be laid out in that order.
+    int ires_by_location[ns3];
+    int subtile_owner[ns3];
+    // Keep the static workspace sized for every PP level that kick.f90 can
+    // select (ires=2..6); the actual tile grid still uses its local maximum.
+    int max_rcp = ratio_sf[5];
+    for (int it = 0; it < ns3; ++it) {
+        const int sx = ixyz3[it][0] - 1, sy = ixyz3[it][1] - 1, sz = ixyz3[it][2] - 1;
+        const int tx = ixyz3[it][3] - 1, ty = ixyz3[it][4] - 1, tz = ixyz3[it][5] - 1;
+        if (sx < 0 || sx >= nns || sy < 0 || sy >= nns || sz < 0 || sz >= nns || tx < 0 ||
+            tx >= nnt || ty < 0 || ty >= nnt || tz < 0 || tz >= nnt || ires[it] < 2 ||
+            ires[it] > 6) {
+            fprintf(stderr, "invalid PP subtile metadata at %d (ires=%d)\n", it, ires[it]);
+            exit(EXIT_FAILURE);
+        }
+        const int location = (((tz * nnt + ty) * nnt + tx) * nns + sz) * nns * nns + sy * nns + sx;
+        ires_by_location[location] = ires[it];
+        subtile_owner[location] = it;
+    }
+    int64_t (*idx_b_r)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb] =
+        (int64_t (*)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb])_idx_b_r;
+    const int j_last = nt + 2 * ncb - 1;
+    const int k_last = nt + 2 * ncb - 1;
+    const int64_t n_used64 = idx_b_r[nnt - 1][nnt - 1][nnt - 1][k_last][j_last];
+    if (n_used64 < 0 || n_used64 > INT_MAX || (size_t)n_used64 * 3 > max_vp) {
+        fprintf(stderr, "invalid PP particle count %lld (max=%zu)\n", (long long)n_used64,
+                max_vp / 3);
+        exit(EXIT_FAILURE);
+    }
+    const int n_used = (int)n_used64;
+    std::vector<uint8_t> active_particles((size_t)n_used, 0);
+
     PPForceWorkspace* ws = get_pp_workspace_static(max_rcp);
 
-    CUDA_CHECK(cudaMemset(ws->d_vp, 0, max_vp * sizeof(float)));
+    CUDA_CHECK(cudaMemset(ws->d_vp, 0, (size_t)n_used * 3 * sizeof(float)));
+    for (int it = 0; it < ns3; ++it) {
+        ptotal[it] = 0.0;
+        ttotal[it] = 0.0;
+    }
 
+    // ires is indexed by PP subtile (ns3), not by the nnt^3 parent tiles.
+    // Build a parent tile at a time so the CUDA work remains tile-granular.
     for (int it = 0; it < nnt * nnt * nnt; it++) {
-        int itile = it;
-        int iapm = ires[itile];
-
-        int tile1[3] = {it / (nnt * nnt) + 1, (it / nnt) % nnt + 1, it % nnt + 1};
+        int tile1[3] = {it % nnt + 1, (it / nnt) % nnt + 1, it / (nnt * nnt) + 1};
         int utile_shift[3] = {0, 0, 0};
         int nc1[3] = {1, 1, 1};
         int nc2[3] = {nt, nt, nt};
 
-        c_pp_force_kernel_tile(itile, iapm, tile1, nc1, nc2, utile_shift, ratio_sf, apm3, _rhoc,
+        c_pp_force_kernel_tile(ires_by_location, subtile_owner, tile1, nc1, nc2, utile_shift, ratio_sf, apm3, _rhoc,
                                _idx_b_r, _xp, ws->d_vp, mass_p_cdm, a_mid, dt, ws,
+                               active_particles.data(), active_particles.size(),
                                &(ws->f2max_teams[it]), ptotal, ttotal);
     }
 
@@ -760,13 +915,9 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
 
     *f2max = _f2max;
 
-    int64_t (*idx_b_r)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb] =
-        (int64_t (*)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb]) _idx_b_r;
-    const int j_last = nt + 2 * ncb - 1;
-    const int k_last = nt + 2 * ncb - 1;
-    int64_t n_used = idx_b_r[nnt - 1][nnt - 1][nnt - 1][k_last][j_last]; // particle count
     size_t vp_elems_used = (size_t)n_used * 3;
-    if (vp_elems_used > max_vp) vp_elems_used = max_vp;
 
-    accumulate_vp_from_device(ws, _vp, vp_elems_used, vmax);
+    accumulate_vp_from_device(ws, _vp, active_particles.data(), vp_elems_used, vmax);
+
+    (void)isort;  // PP updates are disjoint by owner subtile; ordering only affected CPU scheduling.
 }
