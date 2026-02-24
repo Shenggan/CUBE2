@@ -44,7 +44,7 @@ const int64_t np_image_max = np_image * ((int64_t)nte * 1.0 / (int64_t)nt) *
 const int64_t np_tile_max = np_image / (nnt * nnt * nnt) *
                             ((nte * 1.0 / nt) * (nte * 1.0 / nt) * (nte * 1.0 / nt)) * tile_buffer;
 const size_t max_vp = (size_t)np_image_max * 3;
-const size_t VP_CHUNK_ELEMS = 400 * 1024 * 1024;
+const size_t VP_CHUNK_ELEMS = 3 * 80 * 1024 * 1024;
 
 const int64_t ishift = -((int64_t)1 << 15);  // 2^15
 const double rshift = 0.5 - ishift;
@@ -184,9 +184,9 @@ __global__ void pp_force_kernel(const float* __restrict__ xf0, const float* __re
             }
         }
 
-        af0[outer] += ax;
-        af1[outer] += ay;
-        af2[outer] += az;
+        af0[outer] = ax;
+        af1[outer] = ay;
+        af2[outer] = az;
     }
 }
 
@@ -194,19 +194,14 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
                                 const float* __restrict__ af2, const int64_t* __restrict__ ip_local,
                                 const uint32_t* __restrict__ values_sorted,
                                 float* __restrict__ vp_flat, int N, float mass2, float a_mid,
-                                float dt, float* __restrict__ f2_global,
-                                float* __restrict__ vmax_global0, float* __restrict__ vmax_global1,
-                                float* __restrict__ vmax_global2) {
+                                float dt, float* __restrict__ f2_global) {
     extern __shared__ float s[];
     float* sf2 = s;
-    float* sv0 = s + blockDim.x;
-    float* sv1 = s + 2 * blockDim.x;
-    float* sv2 = s + 3 * blockDim.x;
 
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
 
-    float f2 = 0.f, mv0 = 0.f, mv1 = 0.f, mv2 = 0.f;
+    float f2 = 0.f;
 
     if (idx < N) {
         float ax = af0[idx] * mass2;
@@ -227,24 +222,14 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
         vp_flat[ip * 3 + 0] = vx;
         vp_flat[ip * 3 + 1] = vy;
         vp_flat[ip * 3 + 2] = vz;
-
-        mv0 = fabsf(vx);
-        mv1 = fabsf(vy);
-        mv2 = fabsf(vz);
     }
 
     sf2[tid] = f2;
-    sv0[tid] = mv0;
-    sv1[tid] = mv1;
-    sv2[tid] = mv2;
     __syncthreads();
 
     for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
         if (tid < offset) {
             sf2[tid] = fmaxf(sf2[tid], sf2[tid + offset]);
-            sv0[tid] = fmaxf(sv0[tid], sv0[tid + offset]);
-            sv1[tid] = fmaxf(sv1[tid], sv1[tid + offset]);
-            sv2[tid] = fmaxf(sv2[tid], sv2[tid + offset]);
         }
         __syncthreads();
     }
@@ -252,9 +237,6 @@ __global__ void update_v_kernel(const float* __restrict__ af0, const float* __re
     // atomically accumulate each block's maxima into 4 global scalars.
     if (tid == 0) {
         atomicMaxFloatNonNeg(f2_global, sf2[0]);
-        atomicMaxFloatNonNeg(vmax_global0, sv0[0]);
-        atomicMaxFloatNonNeg(vmax_global1, sv1[0]);
-        atomicMaxFloatNonNeg(vmax_global2, sv2[0]);
     }
 }
 
@@ -274,9 +256,6 @@ struct PPForceWorkspace {
     int* d_cell_start;
     int* d_cell_end;
     float* d_f2_out;
-    float* d_v0_out;
-    float* d_v1_out;
-    float* d_v2_out;
     float* d_vp;
 
     float* xf0_h;
@@ -340,9 +319,6 @@ static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
     CUDA_CHECK(cudaMalloc(&ws->d_cell_start, (size_t)ws->grid_num_cap * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws->d_cell_end, (size_t)ws->grid_num_cap * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&ws->d_f2_out, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws->d_v0_out, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws->d_v1_out, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&ws->d_v2_out, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&ws->d_vp, max_vp * sizeof(float)));
 
     CUDA_CHECK(cudaStreamCreate(&ws->h2d_stream));
@@ -396,9 +372,6 @@ static void destroy_pp_workspace(PPForceWorkspace* ws) {
     CUDA_CHECK(cudaFree(ws->d_cell_start));
     CUDA_CHECK(cudaFree(ws->d_cell_end));
     CUDA_CHECK(cudaFree(ws->d_f2_out));
-    CUDA_CHECK(cudaFree(ws->d_v0_out));
-    CUDA_CHECK(cudaFree(ws->d_v1_out));
-    CUDA_CHECK(cudaFree(ws->d_v2_out));
     CUDA_CHECK(cudaFree(ws->d_vp));
 }
 
@@ -429,7 +402,12 @@ static inline PPForceWorkspace* get_pp_workspace_static(int max_rcp) {
     return &g_pp_ws;
 }
 
-static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out, size_t vp_elems_used) {
+static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out, size_t vp_elems_used, float vmax[3]) {
+
+    vmax[0] = 0.0f;
+    vmax[1] = 0.0f;
+    vmax[2] = 0.0f;
+
     const size_t vp_elems = vp_elems_used;
     const size_t chunk_elems = VP_CHUNK_ELEMS;
     const size_t num_chunks = (vp_elems + chunk_elems - 1) / chunk_elems;
@@ -446,12 +424,28 @@ static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_hos
     offset_prev = 0;
     elems_prev = elems0;
 
-    auto add_vp_chunk = [](float* __restrict__ dst, const float* __restrict__ src, size_t count) {
+    auto add_vp_chunk = [&vmax](float* __restrict__ dst, const float* __restrict__ src, size_t count) {
         const int n = (int)count;
-#pragma omp parallel for simd num_threads(ncore) schedule(static)
+        float _vmax_0 = 0.0f;
+        float _vmax_1 = 0.0f;
+        float _vmax_2 = 0.0f;
+#pragma omp parallel for simd num_threads(ncore) schedule(static) reduction(max : _vmax_0, _vmax_1, _vmax_2)
         for (int i = 0; i < n; i++) {
             dst[i] += src[i];
+            if (src[i] != 0.0f) {
+                float v = fabsf(dst[i]);
+                if (i % 3 == 0) {
+                    _vmax_0 = fmaxf(_vmax_0, v);
+                } else if (i % 3 == 1) {
+                    _vmax_1 = fmaxf(_vmax_1, v);
+                } else {
+                    _vmax_2 = fmaxf(_vmax_2, v);
+                }
+            }
         }
+        vmax[0] = fmaxf(vmax[0], _vmax_0);
+        vmax[1] = fmaxf(vmax[1], _vmax_1);
+        vmax[2] = fmaxf(vmax[2], _vmax_2);
     };
 
     for (size_t c = 1; c < num_chunks; c++) {
@@ -483,7 +477,7 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
                                        int utile_shift[3], int ratio_sf[], float apm3[], int* _rhoc,
                                        int64_t* _idx_b_r, int16_t* _xp, float* d_vp_flat,
                                        float mass_p_cdm, float a_mid, float dt,
-                                       PPForceWorkspace* ws, float* f2max_t_, float vmax_t_[3],
+                                       PPForceWorkspace* ws, float* f2max_t_,
                                        double* ptotal, double* ttotal) {
     struct timespec t_total0, t_total1;
     clock_gettime(CLOCK_MONOTONIC, &t_total0);
@@ -615,8 +609,6 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
 
     CUDA_CHECK(cudaMemcpyAsync(ws->d_keys, ws->keys_h, (size_t)N * sizeof(uint32_t),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
-    CUDA_CHECK(cudaMemcpyAsync(ws->d_values, ws->values_h, (size_t)N * sizeof(uint32_t),
-                               cudaMemcpyHostToDevice, ws->h2d_stream));
     CUDA_CHECK(cudaMemcpyAsync(ws->d_xf0, ws->xf0_h, (size_t)N * sizeof(float),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
     CUDA_CHECK(cudaMemcpyAsync(ws->d_xf1, ws->xf1_h, (size_t)N * sizeof(float),
@@ -626,6 +618,8 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
 
     cudaStreamWaitEvent(ws->h2d_stream, ws->event_reduce_done, 0);
 
+    CUDA_CHECK(cudaMemcpyAsync(ws->d_values, ws->values_h, (size_t)N * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, ws->h2d_stream));
     CUDA_CHECK(cudaMemcpyAsync(ws->d_ip_local, ws->ip_local_h, (size_t)N * sizeof(int64_t),
                                cudaMemcpyHostToDevice, ws->h2d_stream));
 
@@ -712,14 +706,10 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
             exit(EXIT_FAILURE);
         }
         CUDA_CHECK(cudaMemsetAsync(ws->d_f2_out, 0, sizeof(float), ws->compute_stream));
-        CUDA_CHECK(cudaMemsetAsync(ws->d_v0_out, 0, sizeof(float), ws->compute_stream));
-        CUDA_CHECK(cudaMemsetAsync(ws->d_v1_out, 0, sizeof(float), ws->compute_stream));
-        CUDA_CHECK(cudaMemsetAsync(ws->d_v2_out, 0, sizeof(float), ws->compute_stream));
-        size_t shmem = (size_t)kUpdateThreads * 4 * sizeof(float);
+        size_t shmem = (size_t)kUpdateThreads * sizeof(float);
         update_v_kernel<<<upd_blocks, kUpdateThreads, shmem, ws->compute_stream>>>(
             ws->d_af0, ws->d_af1, ws->d_af2, ws->d_ip_local, ws->d_values, d_vp_flat, N,
-            mass_p_cdm * mass_p_cdm, a_mid, dt, ws->d_f2_out, ws->d_v0_out, ws->d_v1_out,
-            ws->d_v2_out);
+            mass_p_cdm * mass_p_cdm, a_mid, dt, ws->d_f2_out);
         CUDA_CHECK(cudaGetLastError());
         cudaEventRecord(ws->event_reduce_done, ws->compute_stream);
     }
@@ -727,12 +717,6 @@ extern "C" void c_pp_force_kernel_tile(int itile, int iapm, int tile1[3], int nc
     cudaStreamWaitEvent(ws->d2h_stream, ws->event_reduce_done, 0);
 
     CUDA_CHECK(cudaMemcpyAsync(f2max_t_, ws->d_f2_out, sizeof(float), cudaMemcpyDeviceToHost,
-                               ws->d2h_stream));
-    CUDA_CHECK(cudaMemcpyAsync(vmax_t_, ws->d_v0_out, sizeof(float), cudaMemcpyDeviceToHost,
-                               ws->d2h_stream));
-    CUDA_CHECK(cudaMemcpyAsync(vmax_t_ + 1, ws->d_v1_out, sizeof(float), cudaMemcpyDeviceToHost,
-                               ws->d2h_stream));
-    CUDA_CHECK(cudaMemcpyAsync(vmax_t_ + 2, ws->d_v2_out, sizeof(float), cudaMemcpyDeviceToHost,
                                ws->d2h_stream));
 
     ptotal[itile] = (double)nptile_real;
@@ -763,25 +747,18 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
 
         c_pp_force_kernel_tile(itile, iapm, tile1, nc1, nc2, utile_shift, ratio_sf, apm3, _rhoc,
                                _idx_b_r, _xp, ws->d_vp, mass_p_cdm, a_mid, dt, ws,
-                               &(ws->f2max_teams[it]), ws->vmax_teams + 3 * it, ptotal, ttotal);
+                               &(ws->f2max_teams[it]), ptotal, ttotal);
     }
 
     float _f2max = 0.0f;
-    float _vmax0 = 0.0f, _vmax1 = 0.0f, _vmax2 = 0.0f;
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
     for (int it = 0; it < nnt * nnt * nnt; it++) {
         _f2max = fmaxf(_f2max, ws->f2max_teams[it]);
-        _vmax0 = fmaxf(_vmax0, ws->vmax_teams[3 * it + 0]);
-        _vmax1 = fmaxf(_vmax1, ws->vmax_teams[3 * it + 1]);
-        _vmax2 = fmaxf(_vmax2, ws->vmax_teams[3 * it + 2]);
     }
 
     *f2max = _f2max;
-    vmax[0] = _vmax0;
-    vmax[1] = _vmax1;
-    vmax[2] = _vmax2;
 
     int64_t (*idx_b_r)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb] =
         (int64_t (*)[nnt][nnt][nt + 2 * ncb][nt + 2 * ncb]) _idx_b_r;
@@ -791,5 +768,5 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
     size_t vp_elems_used = (size_t)n_used * 3;
     if (vp_elems_used > max_vp) vp_elems_used = max_vp;
 
-    accumulate_vp_from_device(ws, _vp, vp_elems_used);
+    accumulate_vp_from_device(ws, _vp, vp_elems_used, vmax);
 }
