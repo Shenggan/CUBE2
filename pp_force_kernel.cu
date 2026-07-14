@@ -74,6 +74,52 @@ const int kD2HBufferCount = 2;
         }                                                                                       \
     } while (0)
 
+// One coarray image is one MPI process.  Prefer the rank local to the node so
+// images on different nodes can use the same device ordinal independently.
+static int get_local_rank() {
+    const char* vars[] = {
+        "MPI_LOCALRANKID",        // Intel MPI
+        "OMPI_COMM_WORLD_LOCAL_RANK",
+        "SLURM_LOCALID",
+        "PMI_LOCAL_RANK",
+        "PMI_RANK"                // suitable fallback for a single-node run
+    };
+
+    for (const char* var : vars) {
+        const char* value = getenv(var);
+        if (value != nullptr) return atoi(value);
+    }
+
+    return 0;
+}
+
+static void select_gpu_for_image() {
+    int gpu_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&gpu_count));
+    if (gpu_count < 1) {
+        fprintf(stderr, "No CUDA GPU is visible\n");
+        exit(EXIT_FAILURE);
+    }
+
+    const int local_rank = get_local_rank();
+    // With scheduler-provided CUDA_VISIBLE_DEVICES each process sees exactly
+    // one GPU; its process-local ordinal is then always zero.
+    const int device = (gpu_count == 1) ? 0 : local_rank;
+    if (device < 0 || device >= gpu_count) {
+        fprintf(stderr,
+                "Local rank %d requires GPU %d, but only %d GPU(s) are visible\n",
+                local_rank, device, gpu_count);
+        exit(EXIT_FAILURE);
+    }
+
+    CUDA_CHECK(cudaSetDevice(device));
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    fprintf(stderr, "[GPU bind] local rank %d -> CUDA device %d (%s)\n", local_rank, device,
+            prop.name);
+}
+
 static inline double elapsed_sec(const struct timespec& t1, const struct timespec& t2) {
     return (double)(t2.tv_sec - t1.tv_sec) + (double)(t2.tv_nsec - t1.tv_nsec) * 1.0e-9;
 }
@@ -296,6 +342,7 @@ struct PPForceWorkspace {
 };
 
 static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
+    select_gpu_for_image();
     memset(ws, 0, sizeof(*ws));
 
     ws->max_rcp = max_rcp;
