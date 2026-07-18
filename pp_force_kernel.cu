@@ -18,6 +18,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <mutex>
 #include <vector>
 
 // -------------------------
@@ -93,7 +94,12 @@ static int get_local_rank() {
     return 0;
 }
 
-static void select_gpu_for_image() {
+// Shared by PP and PM3.  Keeping device binding in one C ABI entry prevents
+// the two CUDA paths from disagreeing about rank-to-device mapping.
+static std::once_flag gpu_selection_once;
+
+extern "C" void c_select_gpu_for_image() {
+    std::call_once(gpu_selection_once, []() {
     int gpu_count = 0;
     CUDA_CHECK(cudaGetDeviceCount(&gpu_count));
     if (gpu_count < 1) {
@@ -118,6 +124,7 @@ static void select_gpu_for_image() {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     fprintf(stderr, "[GPU bind] local rank %d -> CUDA device %d (%s)\n", local_rank, device,
             prop.name);
+    });
 }
 
 static inline double elapsed_sec(const struct timespec& t1, const struct timespec& t2) {
@@ -336,13 +343,15 @@ struct PPForceWorkspace {
     cudaStream_t h2d_stream;
     cudaStream_t d2h_stream;
     cudaStream_t compute_stream;
+    cudaStream_t velocity_h2d_stream;
 
     cudaEvent_t event_h2d_done;
     cudaEvent_t event_reduce_done;
+    cudaEvent_t event_velocity_h2d_done;
 };
 
 static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
-    select_gpu_for_image();
+    c_select_gpu_for_image();
     memset(ws, 0, sizeof(*ws));
 
     ws->max_rcp = max_rcp;
@@ -390,8 +399,14 @@ static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
     CUDA_CHECK(cudaStreamCreate(&ws->h2d_stream));
     CUDA_CHECK(cudaStreamCreate(&ws->d2h_stream));
     CUDA_CHECK(cudaStreamCreate(&ws->compute_stream));
+    // This stream must not implicitly synchronize with stream 0.  PM3 uses
+    // stream 0 for its FFT pipeline and waits on this event only at interp.
+    CUDA_CHECK(cudaStreamCreateWithFlags(&ws->velocity_h2d_stream,
+                                         cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreate(&ws->event_h2d_done));
     CUDA_CHECK(cudaEventCreate(&ws->event_reduce_done));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ws->event_velocity_h2d_done,
+                                        cudaEventDisableTiming));
 
     // Pre-record events to avoid first-time recording overhead during the main loop.
     cudaEventRecord(ws->event_reduce_done, ws->compute_stream);
@@ -407,9 +422,11 @@ static void init_pp_workspace(PPForceWorkspace* ws, int max_rcp) {
 static void destroy_pp_workspace(PPForceWorkspace* ws) {
     CUDA_CHECK(cudaEventDestroy(ws->event_h2d_done));
     CUDA_CHECK(cudaEventDestroy(ws->event_reduce_done));
+    CUDA_CHECK(cudaEventDestroy(ws->event_velocity_h2d_done));
     CUDA_CHECK(cudaStreamDestroy(ws->h2d_stream));
     CUDA_CHECK(cudaStreamDestroy(ws->d2h_stream));
     CUDA_CHECK(cudaStreamDestroy(ws->compute_stream));
+    CUDA_CHECK(cudaStreamDestroy(ws->velocity_h2d_stream));
 
     CUDA_CHECK(cudaFreeHost(ws->xf0_h));
     CUDA_CHECK(cudaFreeHost(ws->xf1_h));
@@ -449,6 +466,8 @@ static void destroy_pp_workspace(PPForceWorkspace* ws) {
 
 static PPForceWorkspace g_pp_ws;
 static int g_pp_ws_inited = 0;
+static int g_velocity_accumulator_active = 0;
+static int g_velocity_particle_count = 0;
 
 static void pp_ws_atexit_cleanup() {
     if (g_pp_ws_inited) {
@@ -474,9 +493,62 @@ static inline PPForceWorkspace* get_pp_workspace_static(int max_rcp) {
     return &g_pp_ws;
 }
 
-static inline void accumulate_vp_from_device(PPForceWorkspace* ws, float* vp_host_out,
-                                             const uint8_t* active_particles, size_t vp_elems_used,
-                                             float vmax[3]) {
+// d_vp holds the accumulated velocity increment for the current kick.  The
+// host velocity is never uploaded: PM3 and PP both add their increments here,
+// then PP copies it back once and applies it on the CPU.
+extern "C" float* c_gpu_velocity_begin(int max_rcp, int n_used) {
+    PPForceWorkspace* ws = get_pp_workspace_static(max_rcp);
+    if (n_used < 0 || (size_t)n_used * 3 > max_vp) {
+        fprintf(stderr, "invalid shared velocity particle count %d\n", n_used);
+        exit(EXIT_FAILURE);
+    }
+    const size_t bytes = (size_t)n_used * 3 * sizeof(float);
+    if (bytes)
+        CUDA_CHECK(cudaMemsetAsync(ws->d_vp, 0, bytes, ws->velocity_h2d_stream));
+    CUDA_CHECK(cudaEventRecord(ws->event_velocity_h2d_done,
+                               ws->velocity_h2d_stream));
+    g_velocity_accumulator_active = 1;
+    g_velocity_particle_count = n_used;
+    return ws->d_vp;
+}
+
+extern "C" float* c_gpu_velocity_get(int n_used) {
+    if (!g_velocity_accumulator_active || n_used != g_velocity_particle_count) {
+        fprintf(stderr, "shared GPU velocity accumulator is not initialized (%d != %d)\n",
+                n_used, g_velocity_particle_count);
+        exit(EXIT_FAILURE);
+    }
+    return g_pp_ws.d_vp;
+}
+
+extern "C" float* c_gpu_velocity_acquire(int max_rcp, int n_used) {
+    if (!g_velocity_accumulator_active) return c_gpu_velocity_begin(max_rcp, n_used);
+    return c_gpu_velocity_get(n_used);
+}
+
+// PM3 launches its kernels in stream 0.  Wait for the asynchronous delta
+// buffer clear only when the first interpolation kernel needs that buffer.
+extern "C" void c_gpu_velocity_wait_default_stream() {
+    if (!g_velocity_accumulator_active) {
+        fprintf(stderr, "shared GPU velocity accumulator is not initialized\n");
+        exit(EXIT_FAILURE);
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(0, g_pp_ws.event_velocity_h2d_done, 0));
+}
+
+extern "C" void c_gpu_velocity_finalize() {
+    if (g_pp_ws_inited) {
+        destroy_pp_workspace(&g_pp_ws);
+        g_pp_ws_inited = 0;
+        memset(&g_pp_ws, 0, sizeof(g_pp_ws));
+    }
+    g_velocity_accumulator_active = 0;
+    g_velocity_particle_count = 0;
+}
+
+static inline void accumulate_delta_from_device(PPForceWorkspace* ws, float* vp_host_out,
+                                                const uint8_t* active_particles, size_t vp_elems_used,
+                                                float vmax[3]) {
 
     vmax[0] = 0.0f;
     vmax[1] = 0.0f;
@@ -854,7 +926,7 @@ extern "C" void c_pp_force_kernel_tile(const int ires[ns3], const int subtile_ow
     }
 
     // -------------------------
-    // update vp + reduce max
+    // Accumulate PP velocity increments into the shared device delta buffer.
     // -------------------------
     {
         int upd_blocks = (N + kUpdateThreads - 1) / kUpdateThreads;
@@ -932,7 +1004,13 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
 
     PPForceWorkspace* ws = get_pp_workspace_static(max_rcp);
 
-    CUDA_CHECK(cudaMemset(ws->d_vp, 0, (size_t)n_used * 3 * sizeof(float)));
+    if (!g_velocity_accumulator_active) {
+        c_gpu_velocity_begin(max_rcp, n_used);
+    } else if (g_velocity_particle_count != n_used) {
+        fprintf(stderr, "PM3/PP particle count changed within a kick\n");
+        exit(EXIT_FAILURE);
+    }
+    CUDA_CHECK(cudaStreamWaitEvent(ws->compute_stream, ws->event_velocity_h2d_done, 0));
     for (int it = 0; it < ns3; ++it) {
         ptotal[it] = 0.0;
         ttotal[it] = 0.0;
@@ -964,7 +1042,9 @@ extern "C" void c_pp_force_kernel(int isort[ns3], int ires[ns3], int ixyz3[ns3][
 
     size_t vp_elems_used = (size_t)n_used * 3;
 
-    accumulate_vp_from_device(ws, _vp, active_particles.data(), vp_elems_used, vmax);
+    accumulate_delta_from_device(ws, _vp, active_particles.data(), vp_elems_used, vmax);
+    g_velocity_accumulator_active = 0;
+    g_velocity_particle_count = 0;
 
     (void)isort;  // PP updates are disjoint by owner subtile; ordering only affected CPU scheduling.
 }

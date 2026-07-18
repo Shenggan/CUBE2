@@ -3,9 +3,12 @@ subroutine kick
   use variables
   use pencil_fft
   use cubefft
+#ifdef CUDA
   use iso_c_binding
+#endif
   implicit none
 
+#ifdef CUDA
   interface
       subroutine c_pp_force_kernel(isort, ires, ixyz3, apm3, ratio_sf, &
                                    rhoc, idx_b_r, xp, vp, &
@@ -25,7 +28,23 @@ subroutine kick
           real(c_float), dimension(3), intent(out) :: vmax_t
           real(c_double), dimension(*), intent(out) :: ptotal, ttotal
       end subroutine c_pp_force_kernel
+      subroutine c_pm3_force_kernel(isort,ires,ixyz3,ratio_sf,rhoc,idx_b_r,xp, &
+                                    g2,g4,g6,g8,g12,vp,mass,amid,dt,f2max,vmax,ptotal) &
+                                    bind(C,name='c_pm3_force_kernel')
+          use iso_c_binding
+          integer(c_int),dimension(*),intent(in) :: isort,ires,ixyz3,ratio_sf
+          integer(c_int),dimension(*),intent(in) :: rhoc
+          integer(c_int64_t),dimension(*),intent(in) :: idx_b_r
+          integer(c_int16_t),dimension(*),intent(in) :: xp
+          real(c_float),dimension(*),intent(in) :: g2,g4,g6,g8,g12
+          real(c_float),dimension(*),intent(inout) :: vp
+          real(c_float),value :: mass,amid,dt
+          real(c_float),intent(out) :: f2max
+          real(c_float),dimension(3),intent(out) :: vmax
+          real(c_double),dimension(*),intent(out) :: ptotal
+      end subroutine c_pm3_force_kernel
   end interface
+#endif
 
   logical,parameter :: PM3=.true.
   logical,parameter :: PP=.true.
@@ -119,8 +138,14 @@ subroutine kick
   if (PM3) then ! =====================================================
     if (head) print*, 'PM3'
     call tic(13)
-    allocate(ptotal(ns3),ttotal(ns3)); ptotal=0
+    allocate(ptotal(ns3),ttotal(ns3)); ptotal=0; ttotal=0
     pm%f2max=0; f2_max_pp=0; vmax=0; f2max=0; pt=0; 
+#ifdef CUDA
+    call c_pm3_force_kernel(isort,ires,ixyz3,ratio_sf,rhoc,idx_b_r,xp, &
+                            Gk3_2,Gk3_4,Gk3_6,Gk3_8,Gk3_12,vp, &
+                            sim%mass_p_cdm,a_mid,dt,f2max,vmax,ptotal)
+    pt=sum(ptotal)
+#else
     !$omp paralleldo num_threads(nteam) schedule(dynamic,1)&
     !$omp& default(shared) private(it,iteam,itile,iapm,nl,nh,i1,i2,i3,pm,rho_th,force_th,vmax_team,f2max_team)&
     !$omp& reduction(max:vmax,f2max) reduction(+:pt)
@@ -151,10 +176,15 @@ subroutine kick
       f2max=max(f2max,f2max_team); vmax=max(vmax,vmax_team)
     enddo
     !$omp endparalleldo
+#endif
     sim%dt_pm3=0.5*sqrt( 1. / (sqrt(f2max)*a_mid*G_grid) )
     call toc(13)
     if (head) then
-      print*,'  sum of PM3 density',this_image(),sum(ptotal),pt; print*,'  vmax =',vmax; print*,'  f2max =',f2max
+      print*,'  sum of PM3 density',this_image(),sum(ptotal),pt
+#ifndef CUDA
+      print*,'  vmax =',vmax
+#endif
+      print*,'  f2max =',f2max
       !print*,'  team time =',ttotal
       print*,'  total team time =',sum(ttotal),'secs'; print*,'  real time =',tcat(13,istep),'secs'; print*,''
     endif
@@ -167,32 +197,33 @@ subroutine kick
     call tic(14)
     vmax=0; f2max=0; pt=0
     
-    allocate(ptotal(ns3),ttotal(ns3))
+    allocate(ptotal(ns3),ttotal(ns3)); ptotal=0; ttotal=0
+#ifdef CUDA
     call c_pp_force_kernel(isort, ires, ixyz3, apm3, ratio_sf, &
                            rhoc, idx_b_r, xp, vp, &
                            sim%mass_p_cdm, a_mid, dt, &
                            f2max, vmax, ptotal, ttotal)
-
-    ! allocate(ptotal(ns3),ttotal(ns3))
-    ! !$omp paralleldo num_threads(nteam) schedule(dynamic,1)&
-    ! !$omp& default(shared) private(it,iteam,itile,iapm,nl,nh,i1,i2,i3,pm,rho_th,force_th,vmax_team,f2max_team)&
-    ! !$omp& private(rcp,npgrid,nptile,ll,hoc,ip_local,xf,vf,af)&
-    ! !$omp& reduction(max:vmax,f2max) reduction(+:pt)
-    ! do it=1,ns3
-    !   iteam=omp_get_thread_num()+1; itile=isort(it); iapm=ires(itile);i1=ixyz3(4,itile); i2=ixyz3(5,itile); i3=ixyz3(6,itile);
-    !   pm%pm_layer=3; pm%iapm=iapm; pm%nwork=nft(iapm); pm%nstart(:)=1-nfb(iapm); pm%nend(:)=nfp(iapm)+nfb(iapm); pm%nend(1)=pm%nend(1)+2
-    !   pm%tile1(:)=ixyz3(4:6,itile); pm%tile2(:)=ixyz3(4:6,itile);pm%nloop=1; pm%nex=nfb(iapm)+1; pm%nphy=nfp(iapm); 
-    !   pm%gridsize=1./ratio_sf(iapm); pm%tile_shift=0; pm%utile_shift=ixyz3(1:3,itile)-1; pm%m1=1-nfb(iapm); pm%m2=nfp(iapm)+nfb(iapm);pm%nforce=nfp(iapm); pm%m1phi(:)=1-nfb(iapm); pm%m2phi(:)=nfp(iapm)+nfb(iapm); pm%m2phi(1)=pm%m2phi(1)+2
-    !   pm%sigv1=sigma_vi; pm%sigv2=sigma_vi; pm%nc1(:)=(ixyz3(1:3,itile)-1)*ntt+1; pm%nc2(:)=ixyz3(1:3,itile)*ntt
-    !   nl=pm%nc1; nh=pm%nc2(:); rcp=ratio_sf(iapm); npgrid=ntt*rcp
-    !   nptile=sum(rhoc(nl(1)-1:nh(1)+1,nl(2)-1:nh(2)+1,nl(3)-1:nh(3)+1,pm%tile1(1),pm%tile1(2),pm%tile1(3)))
-    !   allocate(ll(nptile),hoc(1-rcp:npgrid+rcp,1-rcp:npgrid+rcp,1-rcp:npgrid+rcp))
-    !   allocate(ip_local(nptile),xf(3,nptile),vf(3,nptile),af(3,nptile))
-    !   call PP_Force(ll,hoc,ip_local,xf,vf,af,pm,itile,iteam,f2max_team,vmax_team)
-    !   deallocate(ll,hoc,ip_local,xf,vf,af)
-    !   f2max=max(f2max,f2max_team); vmax=max(vmax,vmax_team)
-    ! enddo
-    ! !$omp endparalleldo
+#else
+    !$omp paralleldo num_threads(nteam) schedule(dynamic,1)&
+    !$omp& default(shared) private(it,iteam,itile,iapm,nl,nh,i1,i2,i3,pm,rho_th,force_th,vmax_team,f2max_team)&
+    !$omp& private(rcp,npgrid,nptile,ll,hoc,ip_local,xf,vf,af)&
+    !$omp& reduction(max:vmax,f2max) reduction(+:pt)
+    do it=1,ns3
+      iteam=omp_get_thread_num()+1; itile=isort(it); iapm=ires(itile);i1=ixyz3(4,itile); i2=ixyz3(5,itile); i3=ixyz3(6,itile);
+      pm%pm_layer=3; pm%iapm=iapm; pm%nwork=nft(iapm); pm%nstart(:)=1-nfb(iapm); pm%nend(:)=nfp(iapm)+nfb(iapm); pm%nend(1)=pm%nend(1)+2
+      pm%tile1(:)=ixyz3(4:6,itile); pm%tile2(:)=ixyz3(4:6,itile);pm%nloop=1; pm%nex=nfb(iapm)+1; pm%nphy=nfp(iapm);
+      pm%gridsize=1./ratio_sf(iapm); pm%tile_shift=0; pm%utile_shift=ixyz3(1:3,itile)-1; pm%m1=1-nfb(iapm); pm%m2=nfp(iapm)+nfb(iapm);pm%nforce=nfp(iapm); pm%m1phi(:)=1-nfb(iapm); pm%m2phi(:)=nfp(iapm)+nfb(iapm); pm%m2phi(1)=pm%m2phi(1)+2
+      pm%sigv1=sigma_vi; pm%sigv2=sigma_vi; pm%nc1(:)=(ixyz3(1:3,itile)-1)*ntt+1; pm%nc2(:)=ixyz3(1:3,itile)*ntt
+      nl=pm%nc1; nh=pm%nc2(:); rcp=ratio_sf(iapm); npgrid=ntt*rcp
+      nptile=sum(rhoc(nl(1)-1:nh(1)+1,nl(2)-1:nh(2)+1,nl(3)-1:nh(3)+1,pm%tile1(1),pm%tile1(2),pm%tile1(3)))
+      allocate(ll(nptile),hoc(1-rcp:npgrid+rcp,1-rcp:npgrid+rcp,1-rcp:npgrid+rcp))
+      allocate(ip_local(nptile),xf(3,nptile),vf(3,nptile),af(3,nptile))
+      call PP_Force(ll,hoc,ip_local,xf,vf,af,pm,itile,iteam,f2max_team,vmax_team)
+      deallocate(ll,hoc,ip_local,xf,vf,af)
+      f2max=max(f2max,f2max_team); vmax=max(vmax,vmax_team)
+    enddo
+    !$omp endparalleldo
+#endif
     sim%dt_pp=0.5*sqrt( 1. / (sqrt(f2max)*a_mid*G_grid) )  
     call toc(14)
     if (head) then 
@@ -211,7 +242,7 @@ subroutine kick
       napm(:)=napm(:)+napm(:)[inode]
       sim%dt_pm1=min(sim%dt_pm1,sim[inode]%dt_pm1)
       sim%dt_pm2=min(sim%dt_pm2,sim[inode]%dt_pm2)
-      sim%dt_pm3=min(sim%dt_pm1,sim[inode]%dt_pm3)
+      sim%dt_pm3=min(sim%dt_pm3,sim[inode]%dt_pm3)
       sim%dt_pp=min(sim%dt_pp,sim[inode]%dt_pp)
       sim%dt_vmax=min(sim%dt_vmax,sim[inode]%dt_vmax)
     enddo
